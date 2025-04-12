@@ -159,10 +159,14 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+#Exclude the folder
 RF_data_sets/
 ModRec_Research/
-simulated_data/
 share/
 Scripts/
+
+# Exclude the Folder contents 
+simulated_data/*
+!simulated_data/
 
 
