@@ -4,6 +4,7 @@ from scipy import signal as sig
 import h5py  # Using HDF5 for better structured storage
 from tqdm import tqdm  # Optional: for progress bar
 import sys # Added for exit
+import os
 
 # --- Simulation Parameters ---
 # ... (Keep parameters the same as before) ...
@@ -293,9 +294,13 @@ for i in tqdm(range(num_chunks)):
 print("\nChunk capture simulation complete.")
 
 # --- 4. Data Storage (Using HDF5) ---
-# Add filter info to filename? Optional.
-output_filename = f"simulated_chunks_{f_rf_center / 1e9:.0f}GHz_{bw_total_signal / 1e6:.0f}MHzBW_{modulation}_sdr{sdr_ibw / 1e6:.0f}MHz.h5"
+# Use environment variable for output folder, default to 'simulated_data'
+output_folder = os.environ.get('SIMULATED_DATA_DIR', 'simulated_data')
+os.makedirs(output_folder, exist_ok=True)  # Ensure the folder exists
+
+output_filename = f"{output_folder}/simulated_chunks_{f_rf_center / 1e9:.0f}GHz_{bw_total_signal / 1e6:.0f}MHzBW_{modulation}_sdr{sdr_ibw / 1e6:.0f}MHz.h5"
 print(f"Saving chunk data and metadata to: {output_filename}")
+
 try:
     with h5py.File(output_filename, 'w') as f:
         # Store global attributes
@@ -304,7 +309,7 @@ try:
         f.attrs['modulation'] = modulation
         f.attrs['sdr_ibw_hz'] = sdr_ibw
         f.attrs['sdr_sample_rate_hz'] = fs_sdr
-        f.attrs['num_chunks'] = num_chunks # Target number
+        f.attrs['num_chunks'] = num_chunks  # Target number
         f.attrs['intended_num_chunks'] = num_chunks
         f.attrs['overlap_factor'] = overlap_factor
         f.attrs['snr_db_per_chunk'] = snr_db
@@ -322,9 +327,10 @@ try:
             group = f.create_group(f'chunk_{i_chunk:03d}')
             group.create_dataset('iq_data', data=chunk_data, compression='gzip')
             if i_chunk < len(chunk_metadata):
-                 for key, value in chunk_metadata[i_chunk].items():
-                     group.attrs[key] = value
-            else: print(f"Warning: Metadata missing for chunk index {i_chunk} during save.")
+                for key, value in chunk_metadata[i_chunk].items():
+                    group.attrs[key] = value
+            else:
+                print(f"Warning: Metadata missing for chunk index {i_chunk} during save.")
 
     print("Data saved successfully.")
 except Exception as e:
