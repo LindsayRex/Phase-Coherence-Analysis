@@ -1,295 +1,279 @@
+"""
+Key Changes Summary:
+Pilot Tone Parameters: Added add_pilot_tone, pilot_offset_hz, pilot_power_db at the top.
+Add Pilot to Ground Truth: After generating the main baseband_signal_main, it calculates the pilot amplitude and frequency (relative to baseband center) and adds the complex exponential pilot_signal to it before the final normalization.
+Normalization: The combined signal (main + pilot) is normalized to RMS=1. This is important so that the specified snr_db is correctly applied relative to the total signal power present before noise addition.
+Phase Offset Simulation: The phase offset logic now explicitly uses total_phase_offset = 0.0 when CONFIG_CHOICE == 'perfect_clock', simulating the ideal reference lock. (The random jump logic remains if you switch CONFIG_CHOICE).
+Metadata/Filename: Updated to store pilot parameters and include _PILOT in the filename.
+Plotting: Added vertical lines (axvline) to indicate the absolute RF frequency of the pilot tone on the spectrum plot for visual reference. Legend handling is slightly improved.
+
+"""
+
+# PC_Simulated_data_generator_clocked.py
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal as sig
-import h5py  # Using HDF5 for better structured storage
-from tqdm import tqdm  # Optional: for progress bar
-import sys # Added for exit
+import h5py
+from tqdm import tqdm
+import sys
 import os
 
+print("--- Running Modified Data Generator (Simulating Perfect Clock + PILOT TONE) ---")
+
 # --- Simulation Parameters ---
-# ... (Keep parameters the same as before) ...
 f_rf_center = 25e9
 bw_total_signal = 400e6
 modulation = 'qam16'
 sdr_ibw = 56e6
 adc_bits = 12
 adc_vref = 1.0
-num_chunks = int(np.ceil(bw_total_signal / sdr_ibw))
+num_chunks = 8
 overlap_factor = 0.1
+snr_db = 25 # SNR relative to main signal power
+duration_per_chunk = 100e-6
+tuning_delay = 5e-6
+
+# --- VVVVV PILOT TONE PARAMETERS VVVVV ---
+add_pilot_tone = True
+# Offset from the *center* of the total signal bandwidth
+pilot_offset_hz = 10e6 # Place it 80% towards lower edge
+# Power relative to the main signal's normalized power (RMS=1)
+pilot_power_db = -5 # dB relative to main signal power
+# --- ^^^^^ PILOT TONE PARAMETERS ^^^^^ ---
+
+# Simulation type (controls phase jumps between chunks)
+CONFIG_CHOICE = 'perfect_clock' # Keep perfect clock for this test
+OUTPUT_SUFFIX = '_PERFECT_CLOCK_PILOT' if CONFIG_CHOICE == 'perfect_clock' else '_RANDOM_PHASE_PILOT'
+phase_offset_std_dev_rad_simulated = 0.0 # No random jumps for perfect clock
+
+# --- Derived Parameters (Recalculated) ---
 chunk_spacing = sdr_ibw * (1.0 - overlap_factor)
+actual_num_chunks_needed = int(np.ceil((bw_total_signal - sdr_ibw) / chunk_spacing)) + 1
+if actual_num_chunks_needed > num_chunks:
+    print(f"Warning: Using {num_chunks} chunks, may not cover full BW (need {actual_num_chunks_needed}).")
+
 total_covered_bw = chunk_spacing * (num_chunks - 1) + sdr_ibw
-print(f"Attempting to cover {bw_total_signal / 1e6:.1f} MHz using {num_chunks} chunks.")
-print(f"Chunk spacing: {chunk_spacing / 1e6:.1f} MHz (IBW={sdr_ibw / 1e6:.1f} MHz, Overlap={overlap_factor * 100:.0f}%)")
-print(f"Total spectral span covered by chunks: {total_covered_bw / 1e6:.1f} MHz")
 start_rf_chunk_center = f_rf_center - (chunk_spacing * (num_chunks - 1)) / 2
 rf_chunk_centers = np.linspace(start_rf_chunk_center,
                                start_rf_chunk_center + chunk_spacing * (num_chunks - 1),
                                num_chunks)
-f_lo = 24.0e9
+f_lo = np.floor((np.min(rf_chunk_centers) - sdr_ibw * 0.6) / 1e9) * 1e9
 if_chunk_centers = rf_chunk_centers - f_lo
-print(f"RF Chunk Centers (GHz): {[f / 1e9 for f in rf_chunk_centers]}")
-print(f"IF Chunk Centers (MHz): {[f / 1e6 for f in if_chunk_centers]}")
-if np.any(if_chunk_centers <= sdr_ibw / 2):
-    raise ValueError("IF frequencies too low or negative. Adjust f_lo.")
+if np.any(if_chunk_centers <= 0): raise ValueError("Cannot achieve positive IF.")
+
 oversample_factor_sdr = 1.5
 fs_sdr = sdr_ibw * (2 * oversample_factor_sdr)
-print(f"SDR ADC Sample Rate: {fs_sdr / 1e6:.2f} MHz")
-snr_db = 25
-duration_per_chunk = 100e-6
-num_samples_per_chunk = int(duration_per_chunk * fs_sdr)
-tuning_delay = 5e-6
-phase_noise_std_dev_rad = np.deg2rad(1.0)
+num_samples_per_chunk = int(round(duration_per_chunk * fs_sdr))
+
 max_if_edge_freq = np.max(if_chunk_centers) + sdr_ibw / 2
-print(f"Max IF edge frequency before decimation: {max_if_edge_freq / 1e6:.2f} MHz")
-fs_ground_truth_nyquist_if = 2 * max_if_edge_freq
-oversample_factor_gt = 1.5
-fs_ground_truth = fs_ground_truth_nyquist_if * oversample_factor_gt
-print(f"Required Ground Truth Sim Sample Rate (for IF): {fs_ground_truth / 1e6:.2f} MHz")
-fs_check_baseband = bw_total_signal * (2 * 1.1)
-if fs_ground_truth < fs_check_baseband:
-    fs_ground_truth = fs_check_baseband
-total_sim_time_needed = (duration_per_chunk * num_chunks) + (tuning_delay * (num_chunks - 1))
-num_samples_ground_truth = int(total_sim_time_needed * fs_ground_truth)
+fs_ground_truth = max(2 * max_if_edge_freq * 1.5, bw_total_signal * 2 * 1.1)
+total_sim_time_needed = (duration_per_chunk * num_chunks) + (tuning_delay * max(0, num_chunks - 1))
+num_samples_ground_truth = int(np.ceil(total_sim_time_needed * fs_ground_truth))
 t_ground_truth = np.linspace(0, total_sim_time_needed, num_samples_ground_truth, endpoint=False)
 
-print(f"\n--- Parameters ---")
-print(f"Total Signal BW: {bw_total_signal / 1e6:.1f} MHz @ RF Center {f_rf_center / 1e9:.2f} GHz")
-print(f"SDR IBW: {sdr_ibw / 1e6:.1f} MHz")
-print(f"SDR Sample Rate: {fs_sdr / 1e6:.1f} MHz")
-print(f"Number of Chunks: {num_chunks}")
-print(f"Duration per Chunk: {duration_per_chunk * 1e6:.1f} µs")
-print(f"Samples per Chunk: {num_samples_per_chunk}")
-print(f"Tuning Delay: {tuning_delay * 1e6:.1f} µs")
-print(f"Phase Noise Std Dev: {np.rad2deg(phase_noise_std_dev_rad):.1f} deg")
-print(f"SNR per Chunk: {snr_db} dB (Relative to signal power *after* BPF/Decimation)") # <<< CHANGE: Clarified SNR meaning
-print(f"ADC Bits: {adc_bits}")
-print(f"------------------\n")
+decimation_factor_float = fs_ground_truth / fs_sdr
+decimation_factor = int(round(decimation_factor_float))
+if not np.isclose(decimation_factor_float, decimation_factor): print(f"Warning: Non-integer decimation factor {decimation_factor_float:.4f}. Using {decimation_factor}.")
+
+# Filter params
+bpf_order = 4; bpf_stop_atten_db = 40
+decim_filter_type = 'fir'; decim_zero_phase = False
+decimation_filter_len_approx = 30 * decimation_factor
+bpf_filter_len_approx = bpf_order * 10
+filter_buffer_samples = decimation_filter_len_approx + bpf_filter_len_approx
+min_len_for_processing = filter_buffer_samples + decimation_factor
+estimated_needed_gt_samples_per_slice = int(round(duration_per_chunk * fs_ground_truth)) + filter_buffer_samples
+
+print(f"\n--- Parameters Summary ---")
+print(f"Simulation Type: {CONFIG_CHOICE}")
+print(f"Pilot Tone Added: {add_pilot_tone} (Offset: {pilot_offset_hz/1e6:.2f} MHz, Power: {pilot_power_db} dB)")
+# ... (rest of summary prints) ...
+print(f"Ground Truth Sample Rate: {fs_ground_truth / 1e6:.2f} MHz")
+print(f"Ground Truth Samples: {num_samples_ground_truth}")
+print(f"Decimation Factor: {decimation_factor} (Ratio: {decimation_factor_float:.4f})")
+print(f"--------------------------\n")
+
 
 # --- 1. Generate Wideband Ground Truth Baseband Signal ---
 print("Generating ground truth wideband baseband signal...")
-# ... (Signal generation code remains the same) ...
-generated_baseband = None
-baseband_signal_complex_ground_truth = np.zeros(num_samples_ground_truth, dtype=complex)
+baseband_signal_main = np.zeros(num_samples_ground_truth, dtype=np.complex128)
 
 if modulation.lower() == 'qam16':
+    # ... (Generate QAM16 baseband_symbols as before) ...
     symbol_rate_gt = bw_total_signal / 4
     num_symbols_gt = int(np.ceil(total_sim_time_needed * symbol_rate_gt))
+    print(f"  Modulation: {modulation}, Symbol Rate: {symbol_rate_gt/1e6:.2f} Msps, Num Symbols: {num_symbols_gt}")
     symbols_real = np.random.choice([-3, -1, 1, 3], size=num_symbols_gt)
     symbols_imag = np.random.choice([-3, -1, 1, 3], size=num_symbols_gt)
     symbols = (symbols_real + 1j * symbols_imag) / np.sqrt(10)
-    samples_per_symbol_gt = int(fs_ground_truth / symbol_rate_gt)
-    if samples_per_symbol_gt == 0: samples_per_symbol_gt = 1
+    samples_per_symbol_gt = fs_ground_truth / symbol_rate_gt
+    if samples_per_symbol_gt < 1: samples_per_symbol_gt = 1
+    else: samples_per_symbol_gt = int(round(samples_per_symbol_gt))
     baseband_symbols = np.repeat(symbols, samples_per_symbol_gt)
-    generated_baseband = baseband_symbols
-# Add other modulation types if needed...
-elif modulation.lower() == 'noise':
-     noise_gt = np.random.randn(num_samples_ground_truth) + 1j * np.random.randn(num_samples_ground_truth)
-     nyquist_gt = fs_ground_truth / 2
-     normalized_bw_cutoff = (bw_total_signal / 2) / nyquist_gt
-     if normalized_bw_cutoff >= 1.0: normalized_bw_cutoff = 0.999
-     b_bw, a_bw = sig.butter(5, normalized_bw_cutoff, btype='low', analog=False)
-     baseband_signal_complex_ground_truth = sig.lfilter(b_bw, a_bw, noise_gt)
-
-else: raise ValueError(f"Unsupported modulation: {modulation}")
-
-if modulation.lower() not in ['noise']: # Handle generated baseband assignment
-    if generated_baseband is None: raise RuntimeError("Baseband signal generation failed.")
-    current_len = len(generated_baseband)
-    if current_len > num_samples_ground_truth:
-        baseband_signal_complex_ground_truth = generated_baseband[:num_samples_ground_truth]
-    elif current_len < num_samples_ground_truth:
-        pad_width = num_samples_ground_truth - current_len
-        baseband_signal_complex_ground_truth = np.pad(generated_baseband, (0, pad_width), mode='constant', constant_values=(0 + 0j))
+    current_len = len(baseband_symbols)
+    if current_len >= num_samples_ground_truth:
+        baseband_signal_main = baseband_symbols[:num_samples_ground_truth]
     else:
-        baseband_signal_complex_ground_truth = generated_baseband
+        baseband_signal_main[:current_len] = baseband_symbols
+elif modulation.lower() == 'noise':
+    # ... (Generate bandlimited noise as before) ...
+     print(f"  Modulation: Bandlimited noise")
+     noise_gt = np.random.randn(num_samples_ground_truth) + 1j * np.random.randn(num_samples_ground_truth)
+     nyquist_gt = fs_ground_truth / 2.0
+     normalized_bw_cutoff = (bw_total_signal / 2.0) / nyquist_gt
+     if normalized_bw_cutoff >= 1.0: normalized_bw_cutoff = 0.9999
+     b_bw, a_bw = sig.butter(8, normalized_bw_cutoff, btype='low', analog=False)
+     baseband_signal_main = sig.lfilter(b_bw, a_bw, noise_gt)
+else:
+    raise ValueError(f"Unsupported modulation: {modulation}")
 
-if len(baseband_signal_complex_ground_truth) != num_samples_ground_truth:
-     raise RuntimeError(f"FATAL: Final baseband length mismatch")
+# --- Add Pilot Tone ---
+if add_pilot_tone:
+    pilot_amplitude = np.sqrt(10**(pilot_power_db / 10.0)) # Amplitude relative to RMS=1 signal
+    # Pilot frequency is relative to baseband center (0 Hz)
+    f_pilot_bb = pilot_offset_hz
+    print(f"  Adding pilot tone: Freq = {f_pilot_bb/1e6:.3f} MHz (relative to baseband center), Amplitude = {pilot_amplitude:.4f}")
+    pilot_signal = pilot_amplitude * np.exp(1j * 2 * np.pi * f_pilot_bb * t_ground_truth)
+    baseband_signal_combined = baseband_signal_main + pilot_signal
+else:
+    print("  Skipping pilot tone addition.")
+    baseband_signal_combined = baseband_signal_main
 
-gt_rms_before_norm = np.sqrt(np.mean(np.abs(baseband_signal_complex_ground_truth)**2))
-if gt_rms_before_norm > 1e-20:
-    baseband_signal_complex_ground_truth /= gt_rms_before_norm # Normalize RMS to 1.0 BEFORE any processing
-else: print("Warning: Ground truth signal power is near zero. Skipping normalization.")
+# --- Normalize FINAL ground truth baseband (Signal + Pilot) ---
+gt_rms_before_norm = np.sqrt(np.mean(np.abs(baseband_signal_combined)**2))
+if gt_rms_before_norm > 1e-15:
+    baseband_signal_complex_ground_truth = baseband_signal_combined / gt_rms_before_norm
+    print(f"Ground truth baseband (Signal+Pilot) normalized to RMS=1.0 (Original Combined RMS={gt_rms_before_norm:.4e})")
+else:
+    print("Warning: Combined ground truth signal power is zero. Cannot normalize.")
+    baseband_signal_complex_ground_truth = baseband_signal_combined
 
 print(f"Ground truth baseband signal generated, {len(baseband_signal_complex_ground_truth)} samples.")
 
-# --- 2. Simulate RF Upconversion (Conceptual) ---
+
+# --- Helper function for stats (no changes needed) ---
+def print_stats(label, signal):
+    # ... (same as before) ...
+    if signal is not None and len(signal) > 0:
+        finite_mask = np.isfinite(signal)
+        if np.any(finite_mask):
+            valid_signal = signal[finite_mask]
+            rms = np.sqrt(np.mean(np.abs(valid_signal)**2))
+            mabs = np.max(np.abs(valid_signal)) if len(valid_signal)>0 else 0
+            ratio = mabs / rms if rms > 1e-12 else np.inf
+            print(f"{label:<19}: RMS={rms:.4e}, MaxAbs={mabs:.4e}, Ratio={ratio:.4f} ({len(valid_signal)} finite samples)")
+        else: print(f"{label:<19}: All non-finite data (len={len(signal)})")
+    else: print(f"{label:<19}: Invalid data (None or len=0)")
+
+
+# --- 2. Simulate RF Upconversion (Implicit) ---
+
 # --- 3. Simulate Sequential Chunk Capture ---
 print(f"\nSimulating capture of {num_chunks} chunks...")
 captured_chunks_data = []
 chunk_metadata = []
 current_time_offset = 0.0
-last_chunk_phase_offset = 0.0
-
-# Decimation setup
-decimation_factor_float = fs_ground_truth / fs_sdr
-decimation_factor = int(round(decimation_factor_float))
-if not np.isclose(decimation_factor_float, decimation_factor):
-    print(f"Warning: Non-integer decimation factor. Using {decimation_factor}. Ratio: {decimation_factor_float:.4f}")
-
-# --- Helper function for debug prints ---
-def print_stats(label, signal):
-    if signal is not None and len(signal) > 0 and np.all(np.isfinite(signal)):
-        rms = np.sqrt(np.mean(np.abs(signal)**2))
-        mabs = np.max(np.abs(signal))
-        ratio = mabs / rms if rms > 1e-12 else np.inf
-        print(f"{label:<19}: RMS={rms:.4e}, MaxAbs={mabs:.4e}, Ratio={ratio:.4f}")
-    else:
-        print(f"{label:<19}: Invalid data (len={len(signal) if signal is not None else 0} or non-finite)")
-
 
 for i in tqdm(range(num_chunks)):
+    # ... (Calculate time slice, slice GT signal - same as before) ...
     current_rf_center = rf_chunk_centers[i]
     current_if_center = if_chunk_centers[i]
-
-    # --- Determine Time Slice ---
     start_sample_gt = int(round(current_time_offset * fs_ground_truth))
-    filter_order_bpf = 8 # Corresponds to Cheby2 N=4 used with lfilter
-    # <<< CHANGE: Estimate filter delay for slicing - rough estimate
-    # For IIR, delay varies with freq. For FIR in decimate, it's ~ (order/2) / fs_ground_truth
-    # Add a generous buffer instead of precise calculation for now
-    decimation_filter_length_approx = 60 * decimation_factor # Estimate length of FIR in decimate
-    filter_buffer_samples = filter_order_bpf * 5 + decimation_filter_length_approx # Generous buffer
-    estimated_needed_gt_samples = int(duration_per_chunk * fs_ground_truth) + filter_buffer_samples
-    potential_end_sample_gt = start_sample_gt + estimated_needed_gt_samples
-    actual_end_sample_gt = min(potential_end_sample_gt, num_samples_ground_truth)
-    if start_sample_gt >= actual_end_sample_gt: break
+    actual_end_sample_gt = min(start_sample_gt + estimated_needed_gt_samples_per_slice, num_samples_ground_truth)
+    current_slice_len = actual_end_sample_gt - start_sample_gt
+    if current_slice_len < min_len_for_processing:
+        print(f"\nWarning: Slice for chunk {i} too short ({current_slice_len} < {min_len_for_processing}). Skipping.")
+        current_time_offset += duration_per_chunk + tuning_delay
+        continue
     time_slice_gt = t_ground_truth[start_sample_gt:actual_end_sample_gt]
     baseband_slice_gt = baseband_signal_complex_ground_truth[start_sample_gt:actual_end_sample_gt]
-    if time_slice_gt.shape != baseband_slice_gt.shape: raise RuntimeError("Shape mismatch after slicing!")
-    min_len_for_processing = filter_buffer_samples # Need enough samples for filter transients + decimation
-    if len(time_slice_gt) < min_len_for_processing:
-        print(f"\nWarning: Slice for chunk {i} too short ({len(time_slice_gt)} needed {min_len_for_processing}). Skipping.")
-        current_time_offset += duration_per_chunk + tuning_delay
-        continue
 
-    # --- Debug Print for Chunk 0 ---
-    if i == 0: print(f"\n--- Debug: Chunk {i} Processing Stages (Realistic Filters) ---")
-    if i == 0: print_stats("Baseband Slice", baseband_slice_gt)
-
-    # --- Downconversion ---
+    # --- Downconversion, BPF, Decimate (same as before) ---
     if_signal_chunk_gt_rate = baseband_slice_gt * np.exp(1j * 2 * np.pi * current_if_center * time_slice_gt)
-    if i == 0: print_stats("IF Signal (GT Rate)", if_signal_chunk_gt_rate)
-
-    # --- Band-Pass Filter (Causal) ---
-    low_cutoff = current_if_center - sdr_ibw / 2 * 1.3
-    high_cutoff = current_if_center + sdr_ibw / 2 * 1.3
-    if low_cutoff <= 0: low_cutoff = 1e3
     nyquist_gt = fs_ground_truth / 2.0
-    wn_low = low_cutoff / nyquist_gt
-    wn_high = high_cutoff / nyquist_gt
-    if wn_low <= 0 or wn_high >= 1.0:
-        if wn_high >= 1.0 and np.isclose(wn_high, 1.0): wn_high = 0.999999
-        else: raise ValueError(f"Chunk {i}: Invalid filter freqs. Wn_low={wn_low:.4f}, Wn_high={wn_high:.4f}.")
-    # Use Cheby2 order 4, 40dB stopband atten (effective order approx 8 like filtfilt)
-    b_bpf, a_bpf = sig.cheby2(4, 40, [wn_low, wn_high], btype='bandpass', analog=False)
-    # <<< CHANGE: Use lfilter for causal filtering >>>
-    if_signal_chunk_filtered_gt_rate = sig.lfilter(b_bpf, a_bpf, if_signal_chunk_gt_rate)
-    # <<< CHANGE: REMOVE RMS normalization after BPF >>>
-    # rms_before_bpf = np.sqrt(np.mean(np.abs(if_signal_chunk_gt_rate)**2)) # Removed
-    # rms_after_bpf = np.sqrt(np.mean(np.abs(if_signal_chunk_filtered_gt_rate)**2)) # Removed
-    # if rms_after_bpf > 1e-12: # Removed
-    #     if_signal_chunk_filtered_gt_rate *= rms_before_bpf / rms_after_bpf # Removed
-    if i == 0: print_stats("After BPF (lfilter)", if_signal_chunk_filtered_gt_rate) # Label changed
-
-
-    # --- Decimate (Causal) ---
+    wp_low = (current_if_center - sdr_ibw / 2) / nyquist_gt
+    wp_high = (current_if_center + sdr_ibw / 2) / nyquist_gt
+    ws_low = (current_if_center - sdr_ibw / 2 * 1.5) / nyquist_gt
+    ws_high = (current_if_center + sdr_ibw / 2 * 1.5) / nyquist_gt
+    wp_low = max(1e-6, wp_low); ws_low = max(1e-6, ws_low)
+    wp_high = min(1.0 - 1e-6, wp_high); ws_high = min(1.0 - 1e-6, ws_high)
+    if wp_low >= wp_high or ws_low >= ws_high or ws_low <= 0 or ws_high >= 1:
+         print(f"Warning: Chunk {i} BPF freqs invalid. Skipping BPF.")
+         if_signal_chunk_filtered_gt_rate = if_signal_chunk_gt_rate
+    else:
+         sos_bpf = sig.cheby2(bpf_order, bpf_stop_atten_db, [wp_low, wp_high], btype='bandpass', analog=False, output='sos')
+         if_signal_chunk_filtered_gt_rate = sig.sosfilt(sos_bpf, if_signal_chunk_gt_rate)
     try:
-        # <<< CHANGE: Use zero_phase=False for causal FIR decimation >>>
-        if_signal_chunk_sdr_rate = sig.decimate(if_signal_chunk_filtered_gt_rate, decimation_factor, ftype='fir', zero_phase=False)
+        if_signal_chunk_sdr_rate = sig.decimate(if_signal_chunk_filtered_gt_rate, decimation_factor, ftype=decim_filter_type, zero_phase=decim_zero_phase)
     except ValueError as e:
-        print(f"\nError during decimate for chunk {i}: {e}. Input length: {len(if_signal_chunk_filtered_gt_rate)}. Skipping chunk.")
-        current_time_offset += duration_per_chunk + tuning_delay
-        continue
-    if i == 0: print_stats("After Decimate", if_signal_chunk_sdr_rate) # Label changed, raw removed
+        print(f"\nError during decimate for chunk {i}: {e}. Skipping.")
+        current_time_offset += duration_per_chunk + tuning_delay; continue
 
-    # <<< CHANGE: REMOVE Amplitude Correction after Decimate >>>
-    # rms_after_decimate_unscaled = np.sqrt(np.mean(np.abs(if_signal_chunk_sdr_rate_unscaled)**2)) # Removed
-    # decimation_scale_factor = 1.0 # Removed
-    # if rms_after_decimate_unscaled > 1e-12: # Removed
-    #     decimation_scale_factor = 1.0 / rms_after_decimate_unscaled # Removed
-    #     #if i == 0: print(f"Decim Scale Factor : {decimation_scale_factor:.4f}") # Removed
-    # elif i == 0: print("Warning: Cannot calculate decimation scale factor due to zero RMS.") # Removed
-    # if_signal_chunk_sdr_rate = if_signal_chunk_sdr_rate_unscaled * decimation_scale_factor # Removed
-    # if i == 0: print_stats("After Decim Scale", if_signal_chunk_sdr_rate) # Removed Print
-
-    # --- Trim/Pad (Takes first N samples, implicitly handles delay) ---
-    # Need to potentially trim MORE from the start due to filter delay
-    # Let's keep the simple logic for now: take the first num_samples_per_chunk
-    # This assumes the desired signal portion is still within this block after delays.
-    # A more precise method would estimate group delay and offset the trim.
+    # --- Trim/Pad (same as before) ---
     current_num_samples = len(if_signal_chunk_sdr_rate)
     if current_num_samples >= num_samples_per_chunk:
-        # <<< CONSIDERATION: If group delay is large, the *start* might be transient.
-        # However, trimming from the start complicates overlap. Keep simple for now.
-        if_signal_chunk_sdr_rate = if_signal_chunk_sdr_rate[:num_samples_per_chunk]
+        start_trim_idx = current_num_samples - num_samples_per_chunk
+        final_chunk_signal_before_noise = if_signal_chunk_sdr_rate[start_trim_idx:]
     else:
-        # Pad if too short (might happen at the very end of the simulation)
         pad_needed = num_samples_per_chunk - current_num_samples
-        if_signal_chunk_sdr_rate = np.pad(if_signal_chunk_sdr_rate, (0, pad_needed), mode='constant', constant_values=(0+0j))
-    if i == 0: print_stats("After Trim/Pad", if_signal_chunk_sdr_rate)
+        final_chunk_signal_before_noise = np.pad(if_signal_chunk_sdr_rate, (pad_needed, 0), mode='constant')
 
-    # --- Add Noise ---
-    # <<< CHANGE: SNR is now relative to the *actual* power after filtering/decimation >>>
-    signal_power_chunk = np.mean(np.abs(if_signal_chunk_sdr_rate) ** 2)
-    # Handle potential zero power case
-    if signal_power_chunk < 1e-30: # Use a smaller threshold as power is not normalized
-         noise_chunk = np.zeros(num_samples_per_chunk, dtype=complex)
-         if i==0: print("Warning: Signal power near zero before AWGN.")
+    # --- Add Noise (same as before) ---
+    signal_power_chunk = np.mean(np.abs(final_chunk_signal_before_noise) ** 2)
+    if signal_power_chunk < 1e-30: noise_chunk = np.zeros(num_samples_per_chunk, dtype=complex)
     else:
          snr_linear_chunk = 10 ** (snr_db / 10.0)
          noise_power_chunk = signal_power_chunk / snr_linear_chunk
          noise_std_dev_chunk = np.sqrt(noise_power_chunk / 2.0)
          noise_chunk = noise_std_dev_chunk * (np.random.randn(num_samples_per_chunk) + 1j * np.random.randn(num_samples_per_chunk))
+    if_signal_noisy_chunk = final_chunk_signal_before_noise + noise_chunk
 
-    if_signal_noisy_chunk = if_signal_chunk_sdr_rate + noise_chunk
-    if i == 0: print_stats("After AWGN", if_signal_noisy_chunk)
+    # --- Apply Phase Offset (ZERO relative offset for perfect clock) ---
+    total_phase_offset = 0.0 # No relative jump simulated
+    if_signal_noisy_phase_applied = if_signal_noisy_chunk * np.exp(1j * total_phase_offset)
 
-    # --- Add Phase Noise ---
-    current_phase_noise = np.random.randn() * phase_noise_std_dev_rad
-    total_phase_offset = last_chunk_phase_offset + current_phase_noise
-    if_signal_noisy_chunk *= np.exp(1j * total_phase_offset)
-    last_chunk_phase_offset = total_phase_offset # Accumulate phase offset
-    if i == 0: print_stats("After Phase Noise", if_signal_noisy_chunk)
-
-    # --- Simulate ADC Quantization ---
-    # (Quantization logic remains the same - dynamic scaling based on max value)
-    max_abs_val_chunk = np.max([np.max(np.abs(if_signal_noisy_chunk.real)), np.max(np.abs(if_signal_noisy_chunk.imag))])
-    if max_abs_val_chunk < 1e-15: max_abs_val_chunk = 1e-15 # Avoid division by zero if signal is tiny
-    scale_factor_chunk = (adc_vref / 2.0) / (max_abs_val_chunk * 1.1) # Add 10% headroom
-    signal_scaled_chunk = if_signal_noisy_chunk * scale_factor_chunk
+ # --- Simulate ADC Quantization ---
+    max_abs_val_chunk = np.max([np.max(np.abs(if_signal_noisy_phase_applied.real)), np.max(np.abs(if_signal_noisy_phase_applied.imag))])
+    if max_abs_val_chunk < 1e-15: max_abs_val_chunk = 1e-15
+    scale_factor_chunk = (adc_vref / 2.0) / (max_abs_val_chunk * 1.1)
+    signal_scaled_chunk = if_signal_noisy_phase_applied * scale_factor_chunk
     num_levels = 2 ** adc_bits
     quant_step = adc_vref / num_levels
     quantized_real_chunk = np.round(signal_scaled_chunk.real / quant_step) * quant_step
     quantized_imag_chunk = np.round(signal_scaled_chunk.imag / quant_step) * quant_step
-    quantized_real_chunk = np.clip(quantized_real_chunk, -adc_vref / 2, adc_vref / 2)
-    quantized_imag_chunk = np.clip(quantized_imag_chunk, -adc_vref / 2, adc_vref / 2)
+    quantized_real_chunk = np.clip(quantized_real_chunk, -adc_vref / 2 + quant_step/2, adc_vref / 2 - quant_step/2)
+    quantized_imag_chunk = np.clip(quantized_imag_chunk, -adc_vref / 2 + quant_step/2, adc_vref / 2 - quant_step/2)
+
+    # Combine real and imag parts into the correct variable name
     final_chunk_data_scaled = quantized_real_chunk + 1j * quantized_imag_chunk
-    # Rescale back so the stored data isn't directly tied to adc_vref but preserves quantization noise relative to signal
+
+
+    # Rescale back to original signal level range
     final_chunk_data = final_chunk_data_scaled / scale_factor_chunk
     if i == 0:
          print_stats("After Quant/Rescale", final_chunk_data)
-         print(f"----------------------------------------\n") # End debug prints for chunk 0
 
     # --- Store Chunk Data and Metadata ---
     captured_chunks_data.append(final_chunk_data)
     meta = {
         'chunk_index': i,
         'rf_center_freq_hz': current_rf_center,
-        'if_center_freq_hz': current_if_center,
+        'if_center_freq_hz': current_if_center, # IF center freq for this chunk
         'sdr_sample_rate_hz': fs_sdr,
         'num_samples': len(final_chunk_data),
         'intended_duration_s': duration_per_chunk,
         'start_time_s': current_time_offset,
-        'applied_phase_offset_rad': total_phase_offset,
-        # <<< ADDITION: Add info about filtering used >>>
-        'filter_bpf_method': 'lfilter_cheby2_ord4_rs40',
-        'filter_decim_method': 'fir_zero_phase_False'
+        'applied_phase_offset_rad': total_phase_offset, # Will be 0.0
+        'filter_description': f"BPF: sosfilt_cheby2_ord{bpf_order}_rs{bpf_stop_atten_db}; DECIM: {decim_filter_type}_zero_phase_{decim_zero_phase}",
+        'pilot_tone_added': add_pilot_tone, # Store pilot info
+        'pilot_offset_hz': pilot_offset_hz if add_pilot_tone else None,
+        'pilot_power_db_rel_signal': pilot_power_db if add_pilot_tone else None
     }
     chunk_metadata.append(meta)
 
     # --- Update Time Offset ---
     current_time_offset += duration_per_chunk + tuning_delay
+    # --- End Chunk Loop ---
 
 print("\nChunk capture simulation complete.")
 
@@ -297,40 +281,44 @@ print("\nChunk capture simulation complete.")
 # Use environment variable for output folder, default to 'simulated_data'
 output_folder = os.environ.get('SIMULATED_DATA_DIR', 'simulated_data')
 os.makedirs(output_folder, exist_ok=True)  # Ensure the folder exists
-
 output_filename = f"{output_folder}/simulated_chunks_{f_rf_center / 1e9:.0f}GHz_{bw_total_signal / 1e6:.0f}MHzBW_{modulation}_sdr{sdr_ibw / 1e6:.0f}MHz.h5"
 print(f"Saving chunk data and metadata to: {output_filename}")
-
 try:
     with h5py.File(output_filename, 'w') as f:
         # Store global attributes
+        # ... (copy essential global attributes as before) ...
         f.attrs['rf_center_freq_hz'] = f_rf_center
         f.attrs['total_signal_bandwidth_hz'] = bw_total_signal
         f.attrs['modulation'] = modulation
         f.attrs['sdr_ibw_hz'] = sdr_ibw
         f.attrs['sdr_sample_rate_hz'] = fs_sdr
-        f.attrs['num_chunks'] = num_chunks  # Target number
-        f.attrs['intended_num_chunks'] = num_chunks
+        f.attrs['num_chunks'] = num_chunks
         f.attrs['overlap_factor'] = overlap_factor
         f.attrs['snr_db_per_chunk'] = snr_db
         f.attrs['adc_bits'] = adc_bits
         f.attrs['tuning_delay_s'] = tuning_delay
-        f.attrs['phase_noise_std_dev_rad'] = phase_noise_std_dev_rad
+        f.attrs['phase_offset_std_dev_rad_simulated'] = phase_offset_std_dev_rad_simulated # 0.0
+        # f.attrs['phase_noise_channel_std_dev_rad'] = phase_noise_channel_std_dev_rad # Info only
         f.attrs['ground_truth_sample_rate_hz'] = fs_ground_truth
         f.attrs['num_ground_truth_samples'] = num_samples_ground_truth
         f.attrs['actual_num_chunks_saved'] = len(captured_chunks_data)
-        # <<< ADDITION: Store global filter info >>>
-        f.attrs['filter_description'] = "Causal BPF (lfilter Cheby2 Ord4 rs40) and Causal Decimation (FIR zero_phase=False)"
+        f.attrs['filter_description'] = f"BPF: sosfilt_cheby2_ord{bpf_order}_rs{bpf_stop_atten_db}; DECIM: {decim_filter_type}_zero_phase_{decim_zero_phase}"
+        f.attrs['simulation_type'] = CONFIG_CHOICE # 'perfect_clock' or 'random_phase_jump'
+        f.attrs['pilot_tone_added'] = add_pilot_tone
+        f.attrs['pilot_offset_hz'] = pilot_offset_hz if add_pilot_tone else None
+        f.attrs['pilot_power_db_rel_signal'] = pilot_power_db if add_pilot_tone else None
+        f.attrs['fixed_lo_freq_hz'] = f_lo # Store the LO used
+
 
         # Store each chunk and its metadata
         for i_chunk, chunk_data in enumerate(captured_chunks_data):
-            group = f.create_group(f'chunk_{i_chunk:03d}')
+            group_name = f'chunk_{i_chunk:03d}'
+            group = f.create_group(group_name)
             group.create_dataset('iq_data', data=chunk_data, compression='gzip')
             if i_chunk < len(chunk_metadata):
-                for key, value in chunk_metadata[i_chunk].items():
-                    group.attrs[key] = value
-            else:
-                print(f"Warning: Metadata missing for chunk index {i_chunk} during save.")
+                 for key, value in chunk_metadata[i_chunk].items():
+                     if value is not None: # Avoid storing None attributes
+                        group.attrs[key] = value
 
     print("Data saved successfully.")
 except Exception as e:
@@ -338,48 +326,58 @@ except Exception as e:
     sys.exit(1)
 
 
-# --- 5. Visualization (Example: Spectrum) ---
-# (Plotting code remains the same, but might show different spectral shapes due to causal filters)
+# --- 5. Visualization (Spectrum Plot - adapted for pilot) ---
 plot_results = True
 if plot_results and captured_chunks_data:
     print("Plotting spectrum...")
-    # ... (Spectrum plotting code remains the same) ...
     plt.style.use('seaborn-v0_8-darkgrid')
     plt.figure(figsize=(14, 8))
-    max_overall_magnitude = -np.inf
-    all_finite = True
-    for i_chunk, chunk_data in enumerate(captured_chunks_data): # Renamed loop var
-        if chunk_data is None or len(chunk_data) < 2: continue
-        if not np.all(np.isfinite(chunk_data)):
-             print(f"Warning: Chunk {i_chunk} contains non-finite values. Skipping spectrum plot.")
-             all_finite = False; continue
-        spectrum_chunk = np.fft.fftshift(np.fft.fft(chunk_data))
-        current_max = np.max(np.abs(spectrum_chunk))
-        if current_max > max_overall_magnitude: max_overall_magnitude = current_max
+    max_overall_time_mag = 0.0 # Find max magnitude in time domain for reference
+    num_plotted = 0
 
-    if not all_finite: print("Skipping spectrum plot due to non-finite data.")
-    elif max_overall_magnitude < 1e-12: max_overall_magnitude = 1 # Avoid log10(0)
+    for chunk_data in captured_chunks_data:
+        if chunk_data is not None and len(chunk_data) > 0 and np.all(np.isfinite(chunk_data)):
+            mag = np.max(np.abs(chunk_data))
+            if mag > max_overall_time_mag: max_overall_time_mag = mag
+            num_plotted += 1
 
-    if all_finite:
-         for i_chunk, chunk_data in enumerate(captured_chunks_data): # Renamed loop var
-             if chunk_data is None or len(chunk_data) < 2: continue
+    if num_plotted == 0: print("No valid chunks to plot.")
+    if max_overall_time_mag < 1e-15: max_overall_time_mag = 1.0 # Avoid zero reference
+
+    if num_plotted > 0:
+        for i_chunk, chunk_data in enumerate(captured_chunks_data):
+             if chunk_data is None or len(chunk_data) < 2 or not np.all(np.isfinite(chunk_data)): continue
              if i_chunk < len(chunk_metadata): meta = chunk_metadata[i_chunk]
-             else: continue # Skip if no metadata
+             else: continue
 
-             f_axis_chunk = np.fft.fftshift(np.fft.fftfreq(len(chunk_data), d=1 / meta['sdr_sample_rate_hz']))
-             f_axis_rf = f_axis_chunk + meta['rf_center_freq_hz']
-             spectrum_chunk = np.fft.fftshift(np.fft.fft(chunk_data))
-             spectrum_db = 20 * np.log10(np.abs(spectrum_chunk) / max_overall_magnitude + 1e-12)
-             plt.plot(f_axis_rf / 1e9, spectrum_db, label=f'Chunk {i_chunk} (RF Center: {meta["rf_center_freq_hz"] / 1e9:.3f} GHz)')
+             n_fft = len(chunk_data)
+             freqs_if = np.fft.fftshift(np.fft.fftfreq(n_fft, d=1 / meta['sdr_sample_rate_hz']))
+             rf_freqs = freqs_if + meta['rf_center_freq_hz'] # Shift to conceptual RF
+             spectrum = np.fft.fftshift(np.fft.fft(chunk_data))
+             # Plot dB relative to the max time domain signal amplitude
+             spectrum_db = 20 * np.log10(np.abs(spectrum) / (n_fft * max_overall_time_mag) + 1e-12)
 
-         plt.title(f'Spectra of Captured Chunks (Realistic Filters, Shifted to RF)\nTotal BW={bw_total_signal / 1e6:.1f} MHz, SDR IBW={sdr_ibw / 1e6:.1f} MHz')
-         plt.xlabel('Frequency (GHz)')
-         plt.ylabel('Magnitude (dB rel. Max)')
-         plt.ylim(bottom=-120) # Adjusted ylim potentially
-         plt.grid(True)
-         actual_num_chunks_plotted = len(captured_chunks_data)
-         if actual_num_chunks_plotted > 5: plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left", fontsize='small'); plt.tight_layout(rect=[0, 0, 0.82, 1])
-         else: plt.legend(); plt.tight_layout()
-         plt.show()
+             plt.plot(rf_freqs / 1e9, spectrum_db, label=f'Chunk {i_chunk} (RF: {meta["rf_center_freq_hz"] / 1e9:.3f} GHz)', alpha=0.7)
+
+             # Indicate pilot tone location if added
+             if meta.get('pilot_tone_added', False):
+                  pilot_rf = meta['rf_center_freq_hz'] + meta['pilot_offset_hz'] # Calculate absolute pilot RF
+                  plt.axvline(pilot_rf / 1e9, color='lime', linestyle=':', linewidth=1, alpha=0.6, label=f'_Pilot {i_chunk}' if i_chunk==0 else None)
+
+
+        plt.title(f'Spectra of Captured Chunks ({CONFIG_CHOICE}, Shifted to RF)\nMod: {modulation}, SNR: {snr_db} dB, Pilot: {pilot_power_db if add_pilot_tone else "None"} dB')
+        plt.xlabel('Frequency (GHz)')
+        plt.ylabel('Magnitude (dB rel. Peak Time Signal)')
+        plt.ylim(bottom=-140)
+        plt.grid(True, which='both', linestyle='--')
+        # Create a clean legend
+        handles, labels = plt.gca().get_legend_handles_labels()
+        # Remove duplicate labels (like '_Pilot x')
+        by_label = dict(zip(labels, handles))
+        if len(by_label) > 8: # Avoid overly cluttered legend
+             plt.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.04, 1), loc="upper left", fontsize='small'); plt.tight_layout(rect=[0, 0, 0.85, 1])
+        else:
+             plt.legend(by_label.values(), by_label.keys(), fontsize='small'); plt.tight_layout()
+        plt.show()
 
 print("\nScript finished.")

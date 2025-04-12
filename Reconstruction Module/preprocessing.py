@@ -5,6 +5,12 @@ import numpy as np
 from scipy import signal as sig
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import logging
+from . import log_config
+
+# Setup logging for this module
+log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs")
+logger = logging.getLogger(__name__)
 
 def scale_chunks(chunks, target_rms):
     """
@@ -17,20 +23,20 @@ def scale_chunks(chunks, target_rms):
     Returns:
         list: List of scaled numpy arrays (complex128). Returns None on critical error.
     """
-    print("\n--- Correcting Initial Amplitude Scaling ---")
+    logger.info("--- Correcting Initial Amplitude Scaling ---")
     scaled_chunks = []
-    print("Chunk | RMS Before | Scaling Factor | RMS After  | Max Abs (After)")
-    print("------|------------|----------------|------------|----------------")
+    logger.info("Chunk | RMS Before | Scaling Factor | RMS After  | Max Abs (After)")
+    logger.info("------|------------|----------------|------------|----------------")
     scaling_successful = True
 
     for i, chunk in enumerate(chunks):
         if len(chunk) == 0:
             scaled_chunks.append(chunk)
-            print(f"{i:<5d} | --- EMPTY ---    | ---            | --- EMPTY ---    | ---")
+            logger.info(f"{i:<5d} | --- EMPTY ---    | ---            | --- EMPTY ---    | ---")
             continue
 
         if not np.all(np.isfinite(chunk)):
-            print(f"ERROR: Chunk {i} non-finite BEFORE scaling.")
+            logger.error(f"Chunk {i} non-finite BEFORE scaling.")
             scaling_successful = False
             scaled_chunks.append(chunk) # Append original on error to maintain list length
             continue
@@ -39,7 +45,7 @@ def scale_chunks(chunks, target_rms):
         max_abs_before = np.max(np.abs(chunk)) if len(chunk) > 0 else 0
 
         if rms_before < 1e-12:
-            print(f"{i:<5d} | {rms_before:.4e}       | SKIPPED (Zero) | {rms_before:.4e}       | {max_abs_before:.4e}")
+            logger.info(f"{i:<5d} | {rms_before:.4e}       | SKIPPED (Zero) | {rms_before:.4e}       | {max_abs_before:.4e}")
             scaled_chunks.append(chunk) # Append original if RMS is zero
             continue
 
@@ -47,7 +53,7 @@ def scale_chunks(chunks, target_rms):
         scaled_chunk = (chunk * scaling_factor).astype(np.complex128)
 
         if not np.all(np.isfinite(scaled_chunk)):
-            print(f"ERROR: Chunk {i} non-finite AFTER scaling.")
+            logger.error(f"Chunk {i} non-finite AFTER scaling.")
             scaling_successful = False
             scaled_chunks.append(scaled_chunk) # Append erroneous chunk
             continue
@@ -57,21 +63,16 @@ def scale_chunks(chunks, target_rms):
 
         # Check if scaling achieved the target RMS within a tolerance
         if not np.isclose(rms_after, target_rms, rtol=5e-3): # Relaxed tolerance
-            print(f"WARNING: Chunk {i} RMS scaling mismatch ({rms_after:.4e} vs {target_rms:.4e})")
+            logger.warning(f"Chunk {i} RMS scaling mismatch ({rms_after:.4e} vs {target_rms:.4e})")
 
-        print(f"{i:<5d} | {rms_before:.4e} | {scaling_factor:<14.4f} | {rms_after:.4e} | {max_abs_after:.4e}")
+        logger.info(f"{i:<5d} | {rms_before:.4e} | {scaling_factor:<14.4f} | {rms_after:.4e} | {max_abs_after:.4e}")
         scaled_chunks.append(scaled_chunk)
 
     if not scaling_successful:
-        print("\nERROR: Non-finite values detected during scaling. Proceeding, but results may be affected.")
-        # Decide whether to return None or the partially processed list
-        # return None # Hard fail
-        # For now, return the list which might contain non-finite data
-        pass
+        logger.error("Non-finite values detected during scaling. Proceeding, but results may be affected.")
 
-    print("--- Initial Amplitude Scaling Complete ---")
+    logger.info("--- Initial Amplitude Scaling Complete ---")
     return scaled_chunks
-
 
 def upsample_chunks(chunks, sdr_rate, recon_rate, plot_first=False):
     """
@@ -86,11 +87,11 @@ def upsample_chunks(chunks, sdr_rate, recon_rate, plot_first=False):
     Returns:
         list: List of upsampled numpy arrays (complex128).
     """
-    print("\n--- Upsampling chunks (using polyphase filter) ---")
+    logger.info("--- Upsampling chunks (using polyphase filter) ---")
     upsampled_chunks_list = []
 
     if sdr_rate <= 0 or recon_rate <= 0:
-        print("Error: Invalid sample rates for upsampling.")
+        logger.error("Invalid sample rates for upsampling.")
         return [np.zeros_like(c) for c in chunks] # Return zero arrays matching input structure
 
     for i, chunk_data in tqdm(enumerate(chunks), total=len(chunks), desc="Upsampling"):
@@ -108,7 +109,6 @@ def upsample_chunks(chunks, sdr_rate, recon_rate, plot_first=False):
 
         try:
             rms_in = np.sqrt(np.mean(np.abs(chunk_data)**2))
-            # max_abs_in = np.max(np.abs(chunk_data)) if len(chunk_data)>0 else 0 # For debug
 
             if rms_in < 1e-12:
                 upsampled_chunks_list.append(np.zeros(num_samples_chunk_recon, dtype=complex))
@@ -142,7 +142,7 @@ def upsample_chunks(chunks, sdr_rate, recon_rate, plot_first=False):
 
             # Plotting first chunk if requested
             if i == 0 and plot_first:
-                print("Plotting first upsampled chunk (polyphase method)...")
+                logger.info("Plotting first upsampled chunk (polyphase method)...")
                 plt.figure(figsize=(12, 4))
                 time_axis_debug = np.arange(len(upsampled_chunk)) / recon_rate * 1e6
                 rms_out = np.sqrt(np.mean(np.abs(upsampled_chunk)**2))
@@ -158,7 +158,7 @@ def upsample_chunks(chunks, sdr_rate, recon_rate, plot_first=False):
                 plt.show(block=False); plt.pause(0.1)
 
         except Exception as resample_e:
-            print(f"Error resampling chunk {i}: {resample_e}. Appending zeros.")
+            logger.error(f"Error resampling chunk {i}: {resample_e}. Appending zeros.")
             upsampled_chunks_list.append(np.zeros(num_samples_chunk_recon, dtype=complex))
 
     return upsampled_chunks_list

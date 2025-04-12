@@ -1,0 +1,329 @@
+# pilot_phase_correction.py
+"""Corrects phase discontinuities using pilot tone and optional WPD."""
+
+import numpy as np
+from tqdm import tqdm
+import pywt
+import sys
+import logging # Use logging instead of print for module output
+
+# --- Configure Logging ---
+# Set up basic logging for this module
+# You might want to configure logging level in main.py instead
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Get logger for this module
+
+# --- CuPy Import and Check ---
+try:
+    import cupy as cp
+    try:
+        # Try to select the default device (0) and see if it raises an error
+        cp.cuda.Device(0).use()
+        cupy_available = True
+        logger.info("CuPy found and GPU available.")
+    except cp.cuda.runtime.CUDARuntimeError as e:
+        logger.warning(f"CuPy found, but GPU unavailable/error: {e}. Pilot extraction will use CPU.")
+        cupy_available = False
+except ImportError:
+    logger.warning("CuPy not found. Pilot extraction will use CPU.")
+    cupy_available = False
+# --- End CuPy Import ---
+
+def extract_pilot_phase(signal_segment, fs, pilot_bb_freq, n_fft=None):
+    """
+    Extracts the phase of a pilot tone from a signal segment using FFT.
+    Applies a Hann window before FFT to reduce leakage.
+    Uses GPU via CuPy if available, otherwise uses NumPy.
+
+    Args:
+        signal_segment (np.ndarray or cp.ndarray): The IQ data segment.
+        fs (float): Sample rate (Hz).
+        pilot_bb_freq (float): Expected BASEBAND frequency offset (Hz).
+        n_fft (int, optional): FFT length. Defaults to segment length.
+
+    Returns:
+        float: Estimated phase in radians, or np.nan if not found/error.
+    """
+    is_gpu_array = cupy_available and isinstance(signal_segment, cp.ndarray)
+    xp = cp if is_gpu_array else np
+
+    N = len(signal_segment)
+    if N < 32:
+        logger.debug(f"Segment too short ({N} < 32) for FFT.")
+        return np.nan
+    if n_fft is None: n_fft = N
+    elif n_fft < N: signal_segment = signal_segment[:n_fft]
+    # else: FFT will pad if n_fft > N
+
+    try:
+        # --- VVVVV ADD WINDOWING VVVVV ---
+        window = xp.hanning(len(signal_segment)) # Use Hann window
+        windowed_segment = signal_segment * window
+        # --- ^^^^^ ADD WINDOWING ^^^^^ ---
+
+        # Compute FFT on windowed data
+        fft_result = xp.fft.fft(windowed_segment, n=n_fft) # Use windowed data
+        fft_freqs = xp.fft.fftfreq(n_fft, d=1/fs)
+
+        # Find bin closest to pilot
+        pilot_bin_index = xp.argmin(xp.abs(fft_freqs - pilot_bb_freq))
+
+        # --- Verification ---
+        freq_at_bin = fft_freqs[pilot_bin_index]
+        freq_resolution = fs / n_fft
+        freq_diff = xp.abs(freq_at_bin - pilot_bb_freq)
+        freq_tolerance = 2.5 * freq_resolution
+        mag_at_bin = xp.abs(fft_result[pilot_bin_index])
+        idx_prev = (pilot_bin_index - 1 + n_fft) % n_fft
+        idx_next = (pilot_bin_index + 1) % n_fft
+        neighbor_indices = []
+        if pilot_bin_index != idx_prev: neighbor_indices.append(idx_prev)
+        if pilot_bin_index != idx_next: neighbor_indices.append(idx_next)
+        mag_neighbors = 0.0
+        if neighbor_indices: mag_neighbors = xp.mean(xp.abs(fft_result[neighbor_indices]))
+        min_peak_db_above_neighbors = 10 # Keep at 10dB for now
+
+        logger.info(f"Pilot FFT: Peak at {freq_at_bin/1e6:.3f} MHz, Expected BB Freq {pilot_bb_freq/1e6:.3f} MHz")
+
+        # Check validation
+        if freq_diff > freq_tolerance or \
+           mag_at_bin < 1e-9 or \
+           (mag_neighbors > 1e-15 and 10*xp.log10(mag_at_bin / mag_neighbors) < min_peak_db_above_neighbors) :
+             logger.warning(f"Pilot peak not reliably found near {pilot_bb_freq/1e6:.3f} MHz. "
+                            f"Closest bin at {freq_at_bin/1e6:.3f} MHz (Diff: {freq_diff/1e3:.1f} kHz). Failed validation.")
+             return np.nan
+
+        # Extract phase
+        pilot_phase = xp.angle(fft_result[pilot_bin_index])
+        return float(pilot_phase.get()) if is_gpu_array else float(pilot_phase)
+
+    except Exception as e:
+        logger.error(f"Error during pilot phase extraction: {e}", exc_info=False)
+        return np.nan
+
+
+def correct_phase_wpd(chunks, wavelet='db4', level=4):
+    """
+    Performs intra-chunk phase detrending using Wavelet Packet Decomposition (CPU).
+    Args:
+        chunks (list): List of chunk data (NumPy complex128 arrays).
+        wavelet (str): Name of the wavelet to use.
+        level (int): Decomposition level.
+    Returns:
+        list: List of processed chunks (NumPy arrays).
+    """
+    logger.info(f"Applying Wavelet-Based Phase Correction (Wavelet: {wavelet}, Level: {level})")
+    wpd_corrected_chunks = []
+
+    try:
+        wavelet_obj = pywt.Wavelet(wavelet)
+    except ValueError as e:
+        logger.error(f"Invalid wavelet name '{wavelet}': {e}. Skipping WPD.")
+        return chunks
+    except Exception as e:
+        logger.error(f"Cannot initialize wavelet '{wavelet}': {e}. Skipping WPD.")
+        return chunks
+
+    for i, chunk in tqdm(enumerate(chunks), total=len(chunks), desc="WPD Processing"):
+        chunk_np = np.asarray(chunk) # Ensure NumPy array
+
+        if len(chunk_np) <= 2:
+            wpd_corrected_chunks.append(chunk_np)
+            continue
+
+        try:
+            max_level = pywt.dwt_max_level(len(chunk_np), wavelet_obj)
+            actual_level = min(level, max_level) # Use valid level
+            if level > max_level:
+                logger.warning(f"WPD level {level} > max {max_level} for chunk {i} len {len(chunk_np)}. Using level {actual_level}.")
+            if actual_level <= 0:
+                 logger.warning(f"WPD level {actual_level} invalid for chunk {i}. Skipping WPD for this chunk.")
+                 wpd_corrected_chunks.append(chunk_np)
+                 continue
+
+            wp_real = pywt.WaveletPacket(data=np.real(chunk_np), wavelet=wavelet, mode='symmetric', maxlevel=actual_level)
+            wp_imag = pywt.WaveletPacket(data=np.imag(chunk_np), wavelet=wavelet, mode='symmetric', maxlevel=actual_level)
+            nodes_real = wp_real.get_level(actual_level, 'natural')
+
+            for node_real in nodes_real:
+                try:
+                    node_path = node_real.path
+                    if not isinstance(node_path, str) or node_path not in wp_imag: continue
+                    node_imag = wp_imag[node_path]
+
+                    real_data = np.array(node_real.data) # Ensure numpy array
+                    imag_data = np.array(node_imag.data)
+                    coeffs = real_data + 1j * imag_data
+
+                    if len(coeffs) > 1:
+                        inst_phase = np.unwrap(np.angle(coeffs + 1e-30))
+                        x = np.arange(len(inst_phase))
+                        A = np.vstack([x, np.ones_like(x)]).T
+                        try:
+                            slope, intercept = np.linalg.lstsq(A, inst_phase, rcond=None)[0]
+                            linear_phase = intercept + slope * x
+                            coeffs_corrected = coeffs * np.exp(-1j * linear_phase)
+                            # Update node data directly
+                            node_real.data = coeffs_corrected.real
+                            node_imag.data = coeffs_corrected.imag
+                        except np.linalg.LinAlgError: pass
+                except Exception: pass
+
+            corrected_real = wp_real.reconstruct(update=False)
+            corrected_imag = wp_imag.reconstruct(update=False)
+            corrected_chunk = (corrected_real + 1j * corrected_imag).astype(np.complex128)
+
+            if len(corrected_chunk) != len(chunk_np):
+                 logger.debug(f"WPD Correcting length mismatch chunk {i}: {len(corrected_chunk)} vs {len(chunk_np)}")
+                 corrected_chunk = corrected_chunk[:len(chunk_np)]
+                 if len(corrected_chunk) < len(chunk_np):
+                      corrected_chunk = np.pad(corrected_chunk, (0, len(chunk_np) - len(corrected_chunk)), 'constant')
+
+            # Maintain RMS
+            chunk_rms = np.sqrt(np.mean(np.abs(chunk_np)**2))
+            corrected_rms = np.sqrt(np.mean(np.abs(corrected_chunk)**2))
+            if chunk_rms > 1e-12 and corrected_rms > 1e-12:
+                corrected_chunk *= (chunk_rms / corrected_rms)
+            wpd_corrected_chunks.append(corrected_chunk)
+
+        except Exception as e:
+            logger.error(f"Error during WPD processing for chunk {i}: {e}", exc_info=False)
+            wpd_corrected_chunks.append(chunk_np) # Append original numpy array on error
+
+    logger.info("WPD Phase Correction Complete")
+    return wpd_corrected_chunks
+
+
+def correct_phase_pilot_tone(chunks, metadata, global_attrs,
+                             apply_wpd=False, # Default to False
+                             wavelet='db4', wpd_level=4):
+    """
+    Corrects chunk phases using an embedded pilot tone found in metadata.
+    Optionally applies WPD correction afterwards.
+
+    Args:
+        chunks (list): List of upsampled chunk data (NumPy complex128 arrays).
+        metadata (list): List of metadata dictionaries for each chunk.
+        global_attrs (dict): Global attributes dictionary (must contain pilot info).
+        apply_wpd (bool): If True, run WPD correction after pilot correction.
+        wavelet (str): Wavelet name for WPD.
+        wpd_level (int): Decomposition level for WPD.
+
+    Returns:
+        tuple: (corrected_chunks, estimated_cumulative_phases)
+               - corrected_chunks (list): List of numpy arrays (CPU) with correction(s) applied.
+               - estimated_cumulative_phases (list): Cumulative phase estimated from pilot (CPU floats).
+               Returns original chunks if pilot tone info missing or correction fails.
+    """
+    logger.info("Performing Phase Correction using Pilot Tone...")
+
+    if not chunks or not metadata or len(chunks) != len(metadata):
+        logger.error("Invalid chunks or metadata provided for pilot correction.")
+        return chunks, [0.0] * len(chunks)
+
+    # Get pilot info from global attributes
+    pilot_added = global_attrs.get('pilot_tone_added', False)
+    pilot_bb_offset_hz = global_attrs.get('pilot_offset_hz', None) # This is BASEBAND offset
+
+    if not pilot_added or pilot_bb_offset_hz is None:
+        logger.warning("Pilot tone metadata not found in global_attrs. Skipping pilot correction.")
+        return chunks, [0.0] * len(chunks)
+
+    logger.info(f"Using pilot tone baseband offset: {pilot_bb_offset_hz / 1e6:.3f} MHz")
+
+    # Get sample rate from metadata
+    fs = metadata[0].get('sdr_sample_rate_hz') # Use SDR rate at which chunks were saved
+    if fs is None:
+        logger.error("SDR sample rate ('sdr_sample_rate_hz') not found in metadata[0].")
+        return chunks, [0.0] * len(chunks)
+
+    # Calculate overlap samples
+    overlap_factor = global_attrs.get('overlap_factor', 0.1)
+    chunk_duration_s = metadata[0].get('intended_duration_s')
+    if chunk_duration_s is None:
+        logger.warning(f"intended_duration_s missing from metadata[0]. Estimating overlap from chunk length.")
+        overlap_samples = int(round(len(chunks[0]) * overlap_factor)) if len(chunks)>0 else 0
+    else:
+         overlap_samples = int(round(chunk_duration_s * overlap_factor * fs))
+
+    overlap_samples_fft = overlap_samples # Use the calculated overlap for FFT
+    n_fft_pilot = overlap_samples_fft # FFT length = overlap length
+
+    logger.info(f"Overlap samples for pilot extraction: {overlap_samples_fft}")
+    if overlap_samples_fft < 32:
+        logger.warning(f"Overlap ({overlap_samples_fft}) too small for reliable pilot FFT. Skipping correction.")
+        return chunks, [0.0] * len(chunks)
+
+    # Determine backend (GPU/CPU)
+    xp = cp if cupy_available else np
+
+    # Initialize list to store estimated cumulative phases for each chunk
+    estimated_cumulative_phases = [0.0] * len(chunks)
+    last_valid_pilot_phase_prev_chunk = np.nan # Store the last *successfully measured* phase
+
+    for i in tqdm(range(1, len(chunks)), desc="Pilot Phase Correction"):
+        prev_chunk_idx = i - 1
+        curr_chunk_idx = i
+
+        # Use ORIGINAL chunks for phase estimation
+        prev_chunk_original = np.asarray(chunks[prev_chunk_idx])
+        curr_chunk_original = np.asarray(chunks[curr_chunk_idx])
+
+        if len(prev_chunk_original) < overlap_samples_fft or len(curr_chunk_original) < overlap_samples_fft:
+            logger.warning(f"Insufficient length for FFT overlap between chunk {prev_chunk_idx} and {curr_chunk_idx}. Skipping.")
+            estimated_cumulative_phases[i] = estimated_cumulative_phases[prev_chunk_idx]
+            last_valid_pilot_phase_prev_chunk = np.nan # Force recalculation next time
+            continue
+
+        prev_overlap_cpu = prev_chunk_original[-overlap_samples_fft:]
+        curr_overlap_cpu = curr_chunk_original[:overlap_samples_fft]
+
+        prev_overlap_dev = xp.asarray(prev_overlap_cpu)
+        curr_overlap_dev = xp.asarray(curr_overlap_cpu)
+
+        # Extract pilot phases
+        # Always try to get phase from end of previous chunk's overlap
+        phase_prev_end = extract_pilot_phase(prev_overlap_dev, fs, pilot_bb_offset_hz, n_fft=n_fft_pilot)
+        # Phase at start of current chunk's overlap
+        phase_curr_start = extract_pilot_phase(curr_overlap_dev, fs, pilot_bb_offset_hz, n_fft=n_fft_pilot)
+
+        delta_phi = 0.0 # Default phase difference
+
+        # Use the measurement only if BOTH phases were extracted successfully
+        if not np.isnan(phase_prev_end) and not np.isnan(phase_curr_start):
+            delta_phi = phase_curr_start - phase_prev_end
+            delta_phi = (delta_phi + np.pi) % (2 * np.pi) - np.pi
+            logger.info(f"  Chunk {i}: PrevEnd Phase={np.rad2deg(phase_prev_end):.2f}, CurrStart Phase={np.rad2deg(phase_curr_start):.2f}, Delta Phi={np.rad2deg(delta_phi):.4f} deg")
+            # Update the last known good phase measurement
+            last_valid_pilot_phase_prev_chunk = phase_prev_end # Or maybe phase_curr_start? Let's use prev_end.
+        else:
+            logger.warning(f"Pilot phase extraction failed for boundary {i}. Using delta_phi=0.")
+            delta_phi = 0.0
+            last_valid_pilot_phase_prev_chunk = np.nan # Reset if extraction fails
+
+        # Update cumulative phase
+        prev_cumulative = estimated_cumulative_phases[prev_chunk_idx]
+        current_cumulative_phase = prev_cumulative - delta_phi # Correction is negative of the measured jump
+        estimated_cumulative_phases[i] = current_cumulative_phase
+
+        # Clear GPU memory for this iteration
+        if cupy_available:
+             del prev_overlap_dev, curr_overlap_dev
+             try: cp.get_default_memory_pool().free_all_blocks()
+             except Exception: pass
+
+    # --- Apply corrections to all chunks ---
+    logger.info("Applying calculated pilot tone phase corrections...")
+    final_corrected_chunks = []
+    for i, chunk in enumerate(chunks):
+        chunk_np = np.asarray(chunk) # Ensure NumPy
+        phase_correction_factor = np.exp(-1j * estimated_cumulative_phases[i])
+        final_corrected_chunks.append(chunk_np * phase_correction_factor)
+
+    # --- Optionally Apply WPD Correction ---
+    if apply_wpd:
+        # Pass the pilot-corrected chunks list to the WPD function
+        final_corrected_chunks = correct_phase_wpd(final_corrected_chunks, wavelet=wavelet, level=wpd_level)
+
+    logger.info("Phase Correction steps complete.")
+    return final_corrected_chunks, estimated_cumulative_phases

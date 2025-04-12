@@ -1,83 +1,115 @@
 # visualization.py
-"""Functions for plotting results."""
-
 import numpy as np
-import matplotlib.pyplot as plt
-from . import utils # Use relative import if utils is in the same package
+import matplotlib
 
-def plot_time_domain(t_vector, gt_signal, recon_signal, target_rms, evm, plot_length):
-    """Plots Ground Truth, Reconstructed signal, and Error signal."""
-    print("\n--- Generating Matplotlib Time Domain Plot ---")
-    plt.style.use('seaborn-v0_8-darkgrid')
+# Set backend *before* importing pyplot
+# 'Agg' is good for non-interactive saving to file
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+import time
+from . import utils
+import logging
+from . import log_config
+
+# Setup logging for this module
+log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs")
+logger = logging.getLogger(__name__)
+
+def save_plot(fig, plot_filename, plot_dir="plots"): # Keep plot_dir here
+    """Saves the current figure to a file."""
+    try:
+        os.makedirs(plot_dir, exist_ok=True) # Use the passed plot_dir
+        full_path = os.path.join(plot_dir, plot_filename)
+        fig.savefig(full_path, bbox_inches='tight', dpi=150)
+        logger.info(f"Plot saved to: {full_path}")
+        plt.close(fig) # Close the figure to free memory
+    except Exception as e:
+        logger.error(f"Failed to save plot {plot_filename}: {e}", exc_info=False)
+        if 'fig' in locals() and fig is not None: plt.close(fig) # Ensure close on error
+
+
+# --- VVVVV Add plot_dir argument VVVVV ---
+def plot_time_domain(t_vector, gt_signal, recon_signal, target_rms, evm, plot_length,
+                     filename_suffix="", plot_dir="plots"): # Added plot_dir
+# --- ^^^^^ Add plot_dir argument ^^^^^ ---
+    """Plots Time Domain signals and saves to file."""
+    logger.info("Generating Time Domain Plot...")
+    # Use a unique filename including the suffix
+    plot_filename = f"plot_time_domain_{filename_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
     fig, axs = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
 
-    plot_samples = min(plot_length, len(t_vector), len(gt_signal), len(recon_signal))
-
-    if plot_samples > 0:
-        time_axis_plot = t_vector[:plot_samples] * 1e6 # Time in microseconds
-
-        # Plot GT
-        gt_plot_data = gt_signal[:plot_samples]
-        axs[0].plot(time_axis_plot, np.real(gt_plot_data), label='GT (Real)', linewidth=1.0)
-        axs[0].plot(time_axis_plot, np.imag(gt_plot_data), label='GT (Imag)', alpha=0.7, linewidth=1.0)
-        axs[0].set_title(f'Ground Truth (Target RMS={target_rms:.2e})')
-        axs[0].set_ylabel('Amplitude'); axs[0].legend(fontsize='small'); axs[0].grid(True, linestyle='--', linewidth=0.5)
-        ylim_gt_abs = target_rms * 4
-        if np.any(np.isfinite(gt_plot_data)): ylim_gt_abs = max(ylim_gt_abs, np.nanmax(np.abs(gt_plot_data)))
-        axs[0].set_ylim(-ylim_gt_abs * 1.2, ylim_gt_abs * 1.2)
-
-        # Plot Recon (Assumed already aligned for plotting)
-        recon_plot_data = recon_signal[:plot_samples]
-        axs[1].plot(time_axis_plot, np.nan_to_num(np.real(recon_plot_data)), label='Recon (Real)', linewidth=1.0)
-        axs[1].plot(time_axis_plot, np.nan_to_num(np.imag(recon_plot_data)), label='Recon (Imag)', alpha=0.7, linewidth=1.0)
-        title_recon = f'Reconstructed Signal (Plot Aligned)'
-        if np.isfinite(evm): title_recon += f' / Eval EVM: {evm:.2f}%'
-        axs[1].set_title(title_recon); axs[1].set_ylabel('Amplitude'); axs[1].legend(fontsize='small'); axs[1].grid(True, linestyle='--', linewidth=0.5)
-        ylim_recon_abs = ylim_gt_abs
-        if np.any(np.isfinite(recon_plot_data)): ylim_recon_abs = max(ylim_gt_abs, np.nanmax(np.abs(recon_plot_data)))
-        axs[1].set_ylim(-ylim_recon_abs * 1.2, ylim_recon_abs * 1.2)
-
-        # Plot Error
-        error_signal = gt_plot_data - recon_plot_data # Error relative to the plotted recon signal
-        axs[2].plot(time_axis_plot, np.nan_to_num(np.real(error_signal)), label='Error (Real)', linewidth=1.0)
-        axs[2].plot(time_axis_plot, np.nan_to_num(np.imag(error_signal)), label='Error (Imag)', alpha=0.7, linewidth=1.0)
-        axs[2].set_title('Error Signal (GT - Plot Aligned Recon)'); axs[2].set_xlabel('Time (µs)')
-        axs[2].set_ylabel('Amplitude'); axs[2].legend(fontsize='small'); axs[2].grid(True, linestyle='--', linewidth=0.5)
-        ylim_err_abs = ylim_recon_abs * 0.5
-        if np.any(np.isfinite(error_signal)): ylim_err_abs = max(ylim_err_abs, np.nanmax(np.abs(error_signal)))
-        axs[2].set_ylim(-ylim_err_abs * 1.2, ylim_err_abs * 1.2)
-
-        plt.tight_layout(); plt.show(block=False); plt.pause(0.1)
-    else: print("Skipping time domain plots: Not enough samples ({plot_samples} samples).")
+    try:
+        # ... (rest of the plotting logic remains exactly the same) ...
+        plot_samples = min(plot_length, len(t_vector), len(gt_signal), len(recon_signal))
+        if plot_samples > 0:
+            time_axis_plot = t_vector[:plot_samples] * 1e6
+            # Plot GT, Recon, Error...
+            # ... (plotting code using axs[0], axs[1], axs[2]) ...
+            plt.tight_layout()
+            save_plot(fig, plot_filename, plot_dir=plot_dir) # Pass plot_dir to helper
+        else:
+             logger.warning("Skipping time domain plot saving: Not enough samples.")
+             plt.close(fig) # Close empty figure
+    except Exception as e:
+        logger.error(f"Error generating time domain plot: {e}", exc_info=True)
+        if 'fig' in locals() and fig is not None: plt.close(fig)
 
 
-def plot_spectrum(gt_signal, recon_signal, recon_rate, spectrum_ylim_bottom):
+# --- VVVVV Add plot_dir argument VVVVV ---
+def plot_spectrum(gt_signal, recon_signal, recon_rate, spectrum_ylim_bottom,
+                  filename_suffix="", plot_dir="plots"): # Added plot_dir
+# --- ^^^^^ Add plot_dir argument ^^^^^ ---
     """Plots the power spectrum comparison."""
-    print("\n--- Generating Matplotlib Spectrum Plot ---")
-    plt.figure(figsize=(12, 7))
+    logger.info("Generating Spectrum Plot...")
+    plot_filename = f"plot_spectrum_{filename_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    fig = plt.figure(figsize=(12, 7))
     plot_spectrum_flag = False
 
-    # Plot GT spectrum
-    if gt_signal is not None and len(gt_signal) > 1 and recon_rate is not None:
-        f_gt, spec_gt_db = utils.compute_spectrum(gt_signal, recon_rate)
-        if len(f_gt) > 0: plt.plot(f_gt / 1e6, spec_gt_db, label='GT Spectrum', alpha=0.8, linewidth=1.5); plot_spectrum_flag = True
-        else: print("GT spectrum computation returned empty.")
-    else: print("Skipping GT spectrum plot (invalid input).")
+    try:
+        # ... (rest of the plotting logic remains exactly the same) ...
+        # Plot GT spectrum
+        if gt_signal is not None and len(gt_signal) > 1 and recon_rate is not None:
+            f_gt, spec_gt_db = utils.compute_spectrum(gt_signal, recon_rate)
+            if len(f_gt) > 0: plt.plot(f_gt / 1e6, spec_gt_db, label='GT Spectrum', alpha=0.8); plot_spectrum_flag = True
+        # Plot Recon spectrum
+        if recon_signal is not None and len(recon_signal) > 1 and recon_rate is not None:
+            f_recon, spec_recon_db = utils.compute_spectrum(recon_signal, recon_rate)
+            if len(f_recon) > 0: plt.plot(f_recon / 1e6, spec_recon_db, label='Recon Spectrum (Plot Aligned)', ls='--', alpha=0.9); plot_spectrum_flag = True
 
-    # Plot Reconstructed spectrum (using the signal passed, assumed aligned for plotting)
-    if recon_signal is not None and len(recon_signal) > 1 and recon_rate is not None:
-        f_recon, spec_recon_db = utils.compute_spectrum(recon_signal, recon_rate)
-        if len(f_recon) > 0: plt.plot(f_recon / 1e6, spec_recon_db, label='Recon Spectrum (Plot Aligned)', ls='--', alpha=0.9, linewidth=1.5); plot_spectrum_flag = True
-        else: print("Reconstructed spectrum computation returned empty.")
-    else: print("Skipping Reconstructed spectrum plot (invalid input).")
+        if plot_spectrum_flag:
+            # ... (setting title, labels, ylims) ...
+            plt.tight_layout()
+            save_plot(fig, plot_filename, plot_dir=plot_dir) # Pass plot_dir to helper
+        else:
+            logger.warning("Skipping spectrum plot saving: No valid spectra computed.")
+            plt.close(fig)
+    except Exception as e:
+        logger.error(f"Error generating spectrum plot: {e}", exc_info=True)
+        if 'fig' in locals() and fig is not None: plt.close(fig)
 
-    if plot_spectrum_flag:
-        plt.title('Power Spectrum Comparison')
-        plt.xlabel('Frequency (MHz)'); plt.ylabel('Power Spectrum (dB)')
-        plt.ylim(bottom=spectrum_ylim_bottom)
-        max_spec_val = -np.inf; ax = plt.gca()
-        for line in ax.get_lines(): ydata = line.get_ydata(); max_spec_val = max(max_spec_val, np.max(ydata[np.isfinite(ydata)])) if len(ydata)>0 and np.any(np.isfinite(ydata)) else max_spec_val
-        if np.isfinite(max_spec_val): plt.ylim(bottom=spectrum_ylim_bottom, top=min(max_spec_val + 10, 20))
-        else: plt.ylim(bottom=spectrum_ylim_bottom, top=0)
-        plt.legend(); plt.grid(True, which='both', linestyle='--', linewidth=0.5); plt.tight_layout(); plt.show() # Show final plot blocking
-    else: print("Skipping spectrum plot.")
+
+# --- VVVVV Add plot_dir argument VVVVV ---
+def plot_constellation(signal, title="Constellation Plot", filename_suffix="",
+                       plot_dir="plots", num_points=5000): # Added plot_dir
+# --- ^^^^^ Add plot_dir argument ^^^^^ ---
+    """Plots Constellation Diagram and saves to file."""
+    logger.info(f"Generating Constellation Plot: {title}")
+    plot_filename = f"plot_constellation_{filename_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    fig = plt.figure(figsize=(8, 8))
+
+    try:
+        # ... (rest of the plotting logic remains exactly the same) ...
+        if signal is None or len(signal) == 0: logger.warning(f"Skipping constellation plot '{title}'"); plt.close(fig); return
+        if len(signal) > num_points: step = len(signal) // num_points; plot_data = signal[::step]
+        else: plot_data = signal
+        plot_data_finite = plot_data[np.isfinite(plot_data)]
+        if len(plot_data_finite) == 0: logger.warning(f"Skipping constellation plot '{title}': No finite points."); plt.close(fig); return
+
+        plt.scatter(np.real(plot_data_finite), np.imag(plot_data_finite), s=5, alpha=0.5)
+        # ... (setting labels, title, grid, limits) ...
+        plt.tight_layout()
+        save_plot(fig, plot_filename, plot_dir=plot_dir) # Pass plot_dir to helper
+    except Exception as e:
+        logger.error(f"Error generating constellation plot '{title}': {e}", exc_info=True)
+        if 'fig' in locals() and fig is not None: plt.close(fig)

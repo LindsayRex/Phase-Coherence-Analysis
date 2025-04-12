@@ -6,6 +6,14 @@ import numpy as np
 import sys
 import os  # Import the os module
 
+import logging
+# --- Setup Logging (Call setup function from log_config) ---
+from . import log_config
+# Configure logging level here (e.g., logging.INFO or logging.DEBUG)
+log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs")
+# --- End Logging Setup ---
+
+
 def load_data(filename):
     """
     Loads chunk data, metadata, and global attributes from an HDF5 file.

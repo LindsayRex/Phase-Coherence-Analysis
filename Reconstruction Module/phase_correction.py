@@ -5,6 +5,12 @@ import numpy as np
 from tqdm import tqdm
 import pywt
 import sys
+import logging
+from . import log_config
+
+# Setup logging for this module
+log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs")
+logger = logging.getLogger(__name__)
 
 # --- CuPy Import and Check ---
 try:
@@ -13,44 +19,25 @@ try:
     try:
         cp.cuda.Device(0).use()
         cupy_available = True
-        print("CuPy found and GPU available. Using GPU acceleration for correlation.")
+        logger.info("CuPy found and GPU available. Using GPU acceleration for correlation.")
     except cp.cuda.runtime.CUDARuntimeError as e:
-        print(f"ERROR: CuPy found, but GPU unavailable/error: {e}. CANNOT PERFORM GPU CORRELATION.")
+        logger.error(f"CuPy found, but GPU unavailable/error: {e}. CANNOT PERFORM GPU CORRELATION.")
         cupy_available = False
 except ImportError:
-    print("ERROR: CuPy not found. CANNOT PERFORM GPU CORRELATION.")
+    logger.error("CuPy not found. CANNOT PERFORM GPU CORRELATION.")
     cupy_available = False
 # --- End CuPy Import ---
 
 
 def correct_phase_correlation(chunks, sdr_rate, recon_rate, base_overlap_factor, min_overlap_factor, max_lag_fraction, max_lag_abs):
-    """
-    Corrects chunk phases using GPU-accelerated time-domain cross-correlation
-    with lag estimation and phasor averaging for phase estimation.
-
-    Args:
-        chunks (list): List of upsampled chunk data (complex128 numpy arrays).
-        sdr_rate (float): Original SDR sample rate (Hz).
-        recon_rate (float): Sample rate of the input chunks (Hz).
-        base_overlap_factor (float): Original overlap factor from metadata.
-        min_overlap_factor (float): Minimum overlap factor to use for correlation.
-        max_lag_fraction (float): Max lag as fraction of overlap samples.
-        max_lag_abs (int): Absolute max lag samples.
-
-    Returns:
-        tuple: (corrected_chunks, estimated_cumulative_phases)
-               - corrected_chunks (list): List of numpy arrays (CPU) with phase correction applied.
-               - estimated_cumulative_phases (list): Estimated cumulative phase offset for each chunk (CPU floats).
-               Returns original chunks if GPU correlation cannot proceed.
-    """
-    print("\n--- Performing Improved Phase Correlation (GPU Required) ---")
+    logger.info("\n--- Performing Improved Phase Correlation (GPU Required) ---")
 
     if not cupy_available:
-        print("FATAL: Skipping phase correlation as GPU/CuPy is not available.")
+        logger.critical("FATAL: Skipping phase correlation as GPU/CuPy is not available.")
         return chunks, [0.0] * len(chunks) # Return originals, cannot proceed
 
     if not chunks:
-        print("Error: No chunks provided for phase correlation.")
+        logger.error("Error: No chunks provided for phase correlation.")
         return [], []
 
     # Calculate overlap samples (on CPU)
@@ -58,11 +45,11 @@ def correct_phase_correlation(chunks, sdr_rate, recon_rate, base_overlap_factor,
     if len(chunks) > 0 and recon_rate > 0:
          chunk_duration_s = len(chunks[0]) / recon_rate
     else:
-         print("Warning: Cannot determine chunk duration for overlap calc.")
+         logger.warning("Warning: Cannot determine chunk duration for overlap calc.")
 
     effective_overlap = max(min_overlap_factor, base_overlap_factor)
     overlap_samples_recon = int(round(chunk_duration_s * effective_overlap * recon_rate)) if recon_rate is not None else 0
-    print(f"Enhanced Overlap samples for Correlation: {overlap_samples_recon}")
+    logger.info(f"Enhanced Overlap samples for Correlation: {overlap_samples_recon}")
 
     # Ensure first chunk is numpy array on CPU
     corrected_chunks = [np.asarray(chunks[0])]
@@ -81,7 +68,7 @@ def correct_phase_correlation(chunks, sdr_rate, recon_rate, base_overlap_factor,
 
         if overlap_samples_recon <= 0 or len(prev_chunk_cpu) < overlap_samples_recon or len(curr_chunk_cpu) < overlap_samples_recon:
             status = f"overlap samples={overlap_samples_recon}" if overlap_samples_recon <= 0 else f"lengths prev={len(prev_chunk_cpu)}, curr={len(curr_chunk_cpu)}"
-            print(f"Warning: Insufficient overlap ({status}) for chunk {i}. Skipping correlation, applying previous phase correction (CPU).")
+            logger.warning(f"Insufficient overlap ({status}) for chunk {i}. Skipping correlation, applying previous phase correction (CPU).")
             estimated_cumulative_phases.append(estimated_cumulative_phases[-1])
             corrected_chunk_cpu = curr_chunk_cpu * np.exp(-1j * estimated_cumulative_phases[-1])
             corrected_chunks.append(corrected_chunk_cpu)
@@ -151,7 +138,7 @@ def correct_phase_correlation(chunks, sdr_rate, recon_rate, base_overlap_factor,
                     delta_phi = float(delta_phi_gpu.get()) # Get CPU float
 
         except Exception as corr_e:
-             print(f"ERROR during GPU correlation computation for chunk {i}: {corr_e}. Using delta_phi=0.")
+             logger.error(f"ERROR during GPU correlation computation for chunk {i}: {corr_e}. Using delta_phi=0.")
              delta_phi = 0.0
              best_lag = 0
         finally:
@@ -164,11 +151,11 @@ def correct_phase_correlation(chunks, sdr_rate, recon_rate, base_overlap_factor,
                  mempool = cp.get_default_memory_pool()
                  mempool.free_all_blocks()
              except Exception as mem_e:
-                 print(f"Warning: Error freeing CuPy memory pool: {mem_e}")
+                 logger.warning(f"Error freeing CuPy memory pool: {mem_e}")
         # --- End GPU Processing Block ---
 
-        # --- Diagnostic Print ---
-        print(f"  Chunk {i}: Est. Lag = {best_lag}, Delta Phi (Phasor Avg, deg) = {np.rad2deg(delta_phi):.4f}")
+        # --- Diagnostic Log ---
+        logger.info(f"  Chunk {i}: Est. Lag = {best_lag}, Delta Phi (Phasor Avg, deg) = {np.rad2deg(delta_phi):.4f}")
 
         # Update cumulative phase (CPU)
         prev_cumulative = estimated_cumulative_phases[-1]
@@ -179,33 +166,18 @@ def correct_phase_correlation(chunks, sdr_rate, recon_rate, base_overlap_factor,
         corrected_chunk_cpu = curr_chunk_cpu * np.exp(-1j * current_cumulative_phase)
         corrected_chunks.append(corrected_chunk_cpu)
 
-    print("--- Improved Phase Correlation Complete ---")
+    logger.info("--- Improved Phase Correlation Complete ---")
     return corrected_chunks, estimated_cumulative_phases
 
-
-# --- WPD function remains unchanged (CPU-based) ---
-# (Make sure the WPD function definition is still present below this line)
+# Update WPD function to use logger
 def correct_phase_wpd(chunks, wavelet, level):
-    """
-    Performs intra-chunk phase detrending using Wavelet Packet Decomposition.
-    NOTE: This implementation had issues in the original script and may not
-          provide significant phase correction benefits as implemented.
-
-    Args:
-        chunks (list): List of chunk data (complex128 numpy arrays).
-        wavelet (str): Name of the wavelet to use (e.g., 'db4').
-        level (int): Decomposition level.
-
-    Returns:
-        list: List of processed chunks. If WPD fails, returns input chunks.
-    """
-    print("\n--- Performing Wavelet-Based Phase Correction (Intra-Chunk Detrending) ---")
+    logger.info("\n--- Performing Wavelet-Based Phase Correction (Intra-Chunk Detrending) ---")
     wpd_corrected_chunks = []
     wavelet_obj = None
     try:
         wavelet_obj = pywt.Wavelet(wavelet)
     except Exception as e:
-        print(f"Fatal Error: Could not initialize wavelet '{wavelet}': {e}. Skipping WPD.")
+        logger.critical(f"Fatal Error: Could not initialize wavelet '{wavelet}': {e}. Skipping WPD.")
         return chunks # Return original chunks if wavelet fails
 
     for i, chunk in tqdm(enumerate(chunks), total=len(chunks), desc="WPD Processing"):
@@ -272,9 +244,9 @@ def correct_phase_wpd(chunks, wavelet, level):
             wpd_corrected_chunks.append(corrected_chunk)
 
         except Exception as e: # Catch errors during WPD setup/reconstruction
-            print(f"  General Error in WPD processing chunk {i}: {e}")
+            logger.error(f"General Error in WPD processing chunk {i}: {e}")
             wpd_corrected_chunks.append(chunk) # Use original on error
 
-    print("--- WPD Phase Correction (Intra-Chunk Detrending) Complete ---")
+    logger.info("--- WPD Phase Correction (Intra-Chunk Detrending) Complete ---")
     # Ensure return is list
     return wpd_corrected_chunks if isinstance(wpd_corrected_chunks, list) else chunks

@@ -2,6 +2,12 @@
 """Functions for generating ground truth and evaluating reconstruction."""
 
 import numpy as np
+import logging
+from . import log_config
+
+# Setup logging for this module
+log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs")
+logger = logging.getLogger(__name__)
 
 def regenerate_ground_truth(global_attrs, total_duration, recon_rate, target_rms):
     """
@@ -19,7 +25,7 @@ def regenerate_ground_truth(global_attrs, total_duration, recon_rate, target_rms
                - time_vector (np.ndarray): Corresponding time vector.
                Returns (None, None) if generation fails.
     """
-    print("\nRegenerating ground truth baseband for comparison...")
+    logger.info("\nRegenerating ground truth baseband for comparison...")
     num_samples = int(round(total_duration * recon_rate)) if recon_rate is not None and total_duration >= 0 else 0
     time_vector = np.linspace(0, total_duration, num_samples, endpoint=False) if num_samples > 0 else np.array([])
     gt_baseband = np.zeros(num_samples, dtype=complex)
@@ -29,51 +35,50 @@ def regenerate_ground_truth(global_attrs, total_duration, recon_rate, target_rms
 
     # --- Validation ---
     if bw_gt is None or bw_gt <= 0:
-        print(f"Error: Invalid ground truth bandwidth ({bw_gt}). Cannot regenerate GT.")
+        logger.error(f"Invalid ground truth bandwidth ({bw_gt}). Cannot regenerate GT.")
         return None, None
-    if recon_rate is None or recon_rate <=0:
-        print(f"Error: Invalid reconstruction sample rate ({recon_rate}). Cannot regenerate GT.")
+    if recon_rate is None or recon_rate <= 0:
+        logger.error(f"Invalid reconstruction sample rate ({recon_rate}). Cannot regenerate GT.")
         return None, None
     if num_samples <= 0:
-        print(f"Error: Zero samples calculated for GT buffer.")
+        logger.error("Zero samples calculated for GT buffer.")
         return None, None
     # --- End Validation ---
 
-    print(f"Attempting GT regeneration for mod: {mod}, BW: {bw_gt/1e6:.2f} MHz")
+    logger.info(f"Attempting GT regeneration for mod: {mod}, BW: {bw_gt/1e6:.2f} MHz")
     if mod.lower() == 'qam16':
         try:
             symbol_rate_gt = bw_gt / 4
-            print(f"Using GT Symbol Rate = {symbol_rate_gt/1e6:.2f} Msps")
+            logger.info(f"Using GT Symbol Rate = {symbol_rate_gt/1e6:.2f} Msps")
             num_symbols_gt = int(np.ceil(total_duration * symbol_rate_gt))
             if num_symbols_gt > 0:
-                # Use a fixed seed for reproducibility? Optional.
-                # np.random.seed(42)
                 symbols = (np.random.choice([-3,-1,1,3], size=num_symbols_gt) + 1j*np.random.choice([-3,-1,1,3], size=num_symbols_gt))/np.sqrt(10)
                 samples_per_symbol_gt = max(1, int(round(recon_rate/symbol_rate_gt)))
                 baseband_symbols = np.repeat(symbols, samples_per_symbol_gt)
                 len_to_take = min(len(baseband_symbols), num_samples)
                 gt_baseband[:len_to_take] = baseband_symbols[:len_to_take]
-                if len_to_take < num_samples: print(f"Info: GT generated ({len_to_take}) shorter than target ({num_samples}). Padded.")
-            else: print("Warning: Calculated zero GT symbols.")
+                if len_to_take < num_samples:
+                    logger.info(f"GT generated ({len_to_take}) shorter than target ({num_samples}). Padded.")
+            else:
+                logger.warning("Calculated zero GT symbols.")
         except Exception as gt_gen_e:
-             print(f"Error during QAM16 GT generation: {gt_gen_e}")
-             return None, None # Fail generation on error
+            logger.error(f"Error during QAM16 GT generation: {gt_gen_e}")
+            return None, None
     else:
-        print(f"Warning: GT regeneration not implemented for '{mod}'. Returning zeros.")
-        # gt_baseband remains zeros
+        logger.warning(f"GT regeneration not implemented for '{mod}'. Returning zeros.")
 
     # Scale GT to target RMS
     gt_rms_before = np.sqrt(np.mean(np.abs(gt_baseband)**2))
-    print(f"GT RMS Before Scale: {gt_rms_before:.4e}")
+    logger.info(f"GT RMS Before Scale: {gt_rms_before:.4e}")
     if gt_rms_before > 1e-20:
         gt_scale_factor = target_rms / gt_rms_before
         gt_baseband *= gt_scale_factor
         gt_rms_after = np.sqrt(np.mean(np.abs(gt_baseband)**2))
-        print(f"Scaled GT baseband. Target RMS: {target_rms:.4e}, Actual RMS: {gt_rms_after:.4e}")
-    else: print("Info: GT baseband power near zero. Scaling skipped.")
+        logger.info(f"Scaled GT baseband. Target RMS: {target_rms:.4e}, Actual RMS: {gt_rms_after:.4e}")
+    else:
+        logger.info("GT baseband power near zero. Scaling skipped.")
 
     return gt_baseband, time_vector
-
 
 def calculate_metrics(gt_signal, recon_signal, reliable_indices, min_reliable_samples):
     """
@@ -90,13 +95,14 @@ def calculate_metrics(gt_signal, recon_signal, reliable_indices, min_reliable_sa
                - metrics (dict): {'mse': float, 'nmse': float, 'evm': float}. Values are np.inf if calculation fails.
                - aligned_recon_signal (np.ndarray): Reconstructed signal scaled for plotting alignment.
     """
+    logger.info("\nCalculating metrics using reliable samples.")
     metrics = {'mse': np.inf, 'nmse': np.inf, 'evm': np.inf}
-    aligned_recon_signal = recon_signal.copy() # Default to final signal if alignment fails
+    aligned_recon_signal = recon_signal.copy()
 
     max_len_eval = min(len(recon_signal), len(gt_signal))
     valid_indices_for_eval = reliable_indices[(reliable_indices >= 0) & (reliable_indices < max_len_eval)]
 
-    print(f"\nCalculating metrics using {len(valid_indices_for_eval)} reliable samples (indices < {max_len_eval}).")
+    logger.info(f"Using {len(valid_indices_for_eval)} reliable samples (indices < {max_len_eval}).")
     if len(valid_indices_for_eval) >= min_reliable_samples:
         gt_reliable = gt_signal[valid_indices_for_eval]
         recon_reliable = recon_signal[valid_indices_for_eval]
@@ -104,14 +110,14 @@ def calculate_metrics(gt_signal, recon_signal, reliable_indices, min_reliable_sa
         if np.all(np.isfinite(gt_reliable)) and np.all(np.isfinite(recon_reliable)):
             mean_power_gt_reliable = np.mean(np.abs(gt_reliable)**2)
             mean_power_recon_reliable = np.mean(np.abs(recon_reliable)**2)
-            print(f"  Mean Power GT (Reliable): {mean_power_gt_reliable:.4e}")
-            print(f"  Mean Power Recon (Reliable): {mean_power_recon_reliable:.4e}")
+            logger.info(f"Mean Power GT (Reliable): {mean_power_gt_reliable:.4e}")
+            logger.info(f"Mean Power Recon (Reliable): {mean_power_recon_reliable:.4e}")
 
             if mean_power_gt_reliable > 1e-20 and mean_power_recon_reliable > 1e-20:
                 power_scale_factor = np.sqrt(mean_power_gt_reliable / mean_power_recon_reliable)
-                aligned_recon_signal = recon_signal * power_scale_factor # Scale *entire* signal for plotting
+                aligned_recon_signal = recon_signal * power_scale_factor
                 recon_reliable_scaled = recon_reliable * power_scale_factor
-                print(f"Applied plotting alignment scale factor: {power_scale_factor:.4f}")
+                logger.info(f"Applied plotting alignment scale factor: {power_scale_factor:.4f}")
 
                 error_reliable = gt_reliable - recon_reliable_scaled
                 mse = np.mean(np.abs(error_reliable)**2)
@@ -122,17 +128,23 @@ def calculate_metrics(gt_signal, recon_signal, reliable_indices, min_reliable_sa
                 metrics['nmse'] = nmse
                 metrics['evm'] = evm
                 rms_aligned_check = np.sqrt(np.mean(np.abs(aligned_recon_signal)**2))
-                print(f"  RMS of Aligned Recon (for plotting): {rms_aligned_check:.4e}")
-            else: print("Warning: Near-zero power in reliable segments. Cannot calculate metrics/align.")
-        else: print("Warning: Non-finite values in reliable segments. Cannot calculate metrics.")
-    else: print(f"Warning: Not enough reliable samples ({len(valid_indices_for_eval)}) for evaluation (Min {min_reliable_samples} required).")
+                logger.info(f"RMS of Aligned Recon (for plotting): {rms_aligned_check:.4e}")
+            else:
+                logger.warning("Near-zero power in reliable segments. Cannot calculate metrics/align.")
+        else:
+            logger.warning("Non-finite values in reliable segments. Cannot calculate metrics.")
+    else:
+        logger.warning(f"Not enough reliable samples ({len(valid_indices_for_eval)}) for evaluation (Min {min_reliable_samples} required).")
 
-    print("\nEvaluation Metrics:")
-    print(f"  MSE : {metrics['mse']:.4e}")
+    logger.info("\nEvaluation Metrics:")
+    logger.info(f"MSE : {metrics['mse']:.4e}")
     nmse_val = metrics['nmse']
-    if np.isfinite(nmse_val) and nmse_val > 1e-20: print(f"  NMSE: {nmse_val:.4e} ({10*np.log10(nmse_val):.2f} dB)")
-    elif np.isfinite(nmse_val): print(f"  NMSE: {nmse_val:.4e} (dB invalid)")
-    else: print(f"  NMSE: {nmse_val}")
-    print(f"  EVM : {metrics['evm']:.2f}%" if np.isfinite(metrics['evm']) else f"  EVM : {metrics['evm']}")
+    if np.isfinite(nmse_val) and nmse_val > 1e-20:
+        logger.info(f"NMSE: {nmse_val:.4e} ({10*np.log10(nmse_val):.2f} dB)")
+    elif np.isfinite(nmse_val):
+        logger.info(f"NMSE: {nmse_val:.4e} (dB invalid)")
+    else:
+        logger.info(f"NMSE: {nmse_val}")
+    logger.info(f"EVM : {metrics['evm']:.2f}%" if np.isfinite(metrics['evm']) else f"EVM : {metrics['evm']}")
 
     return metrics, aligned_recon_signal
