@@ -4,13 +4,15 @@
 import h5py
 import numpy as np
 import sys
+import os  # Import the os module
 
 def load_data(filename):
     """
     Loads chunk data, metadata, and global attributes from an HDF5 file.
 
     Args:
-        filename (str): Path to the HDF5 input file.
+        filename (str): Path to the HDF5 input file.  If just a filename is provided,
+                        it will look in the SIMULATED_DATA_DIR environment variable.
 
     Returns:
         tuple: (loaded_chunks, loaded_metadata, global_attrs)
@@ -19,6 +21,12 @@ def load_data(filename):
                - global_attrs (dict): Dictionary containing global attributes from the HDF5 file.
         Returns (None, None, None) on error.
     """
+    # Check if the filename is an absolute path or just a filename
+    if not os.path.isabs(filename):
+        # If it's just a filename, prepend the SIMULATED_DATA_DIR
+        simulated_data_dir = os.environ.get('SIMULATED_DATA_DIR', 'simulated_data')
+        filename = os.path.join(simulated_data_dir, filename)
+
     print(f"Loading data from: {filename}")
     loaded_chunks = []
     loaded_metadata = []

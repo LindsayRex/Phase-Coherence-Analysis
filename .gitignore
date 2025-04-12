@@ -161,3 +161,8 @@ cython_debug/
 
 RF_data_sets/
 ModRec_Research/
+simulated_data/
+share/
+Scripts/
+
+
