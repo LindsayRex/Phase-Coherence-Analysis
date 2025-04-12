@@ -3,12 +3,14 @@
 import numpy as np
 import sys
 import time
-import logging 
+import logging
 
 # --- Setup Logging (Call setup function from log_config) ---
 from . import log_config
-# Configure logging level here (e.g., logging.INFO or logging.DEBUG)
+# Configure logging level here ONCE for the entire application
+# --- VVVVV CORRECTED LEVEL VVVVV ---
 log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs")
+
 # --- End Logging Setup ---
 
 # --- Imports for Modules ---
@@ -236,7 +238,7 @@ def main():
 
 # Configure logging when the script is imported or run
 # Moved setup call outside main to ensure logger is ready
-log_config.setup_logging(level=logging.INFO, log_dir="run_logs") # Default to INFO
+log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs") # Default to INFO
 
 if __name__ == "__main__":
     # Optionally override log level from command line?

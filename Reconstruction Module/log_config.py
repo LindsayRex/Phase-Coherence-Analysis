@@ -1,3 +1,29 @@
+"""
+Predefined Levels: We assign a specific logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) to each logger. call in the code based on the type of event we expect that message to represent.
+    logger.info("Starting step X") - Normal progress.
+    logger.debug(f"Calculated factor = {value}") - Detailed internal value, useful for deep debugging.
+    logger.warning("Overlap is small, results might be affected") - Something unexpected happened, but the code can continue, possibly with reduced accuracy.
+    logger.error("File not found") - A significant error occurred that prevents a step from completing correctly, but the program might try to continue or fail gracefully.
+    logger.critical("Cannot allocate memory, exiting") - A fatal error preventing the program from continuing at all.
+
+Filtering by Configuration: When we run the program, we set a minimum logging level in main.py via log_config.setup_logging(level=...).
+    If we set level=logging.INFO, the logger will process and output (to the file in our case) all messages logged with level INFO, WARNING, ERROR, and CRITICAL. It will ignore any messages logged with DEBUG.
+    If we set level=logging.DEBUG, the logger will process and output all messages from DEBUG up to CRITICAL.
+
+Analogy: Think of it like setting a volume control for your logs.
+
+    Writing logger.debug(...) in the code is like recording a very quiet whisper.
+    Writing logger.info(...) is like recording normal speech.
+    Writing logger.warning(...) is like recording a shout.
+    Writing logger.error(...) is like recording an alarm bell.
+
+When you run the script, log_config.setup_logging(level=...) sets the playback volume threshold.
+    level=logging.INFO means "only play back normal speech and louder (shouts, alarms)". Whispers (DEBUG) are ignored.
+    level=logging.DEBUG means "play back everything, from whispers to alarms".
+
+"""
+
+
 # log_config.py
 import logging
 import os

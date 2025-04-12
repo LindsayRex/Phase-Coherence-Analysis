@@ -46,7 +46,7 @@ EXPECTED_PILOT_IN_DATA = True
 PILOT_FFT_FACTOR = 4 # Factor for FFT zero-padding (e.g., 4)
 
 # --- WPD Parameters ---
-APPLY_WPD_CORRECTION = True # CONTROL WPD: Set True/False as needed
+APPLY_WPD_CORRECTION = False # CONTROL WPD: Set True/False as needed
 WPD_WAVELET = 'db4'
 WPD_LEVEL = 4
 
@@ -65,7 +65,7 @@ EVAL_MIN_RELIABLE_SAMPLES = 10
 # Set True/False depending on whether you want to run the post-stitch equalizer
 APPLY_LMS_EQUALIZER = True # Set to False when testing pilot/WPD alone
 LMS_NUM_TAPS = 21
-LMS_MU = 1e-7 # Start very small if APPLY_LMS_EQUALIZER is True
+LMS_MU = 1e-6 # Start very small if APPLY_LMS_EQUALIZER is True
 
 
 # --- Debugging Flags ---
