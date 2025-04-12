@@ -3,7 +3,7 @@
 
 To Generate Simulated data signal to analysis: 
     
-    Python -m "PC_Simulated_data_generator.py"
+    Python "PC_Simulated_data_generator.py"
 
 To reconstruct the 400MHz signal with the reconstruction module using wavelets: 
 

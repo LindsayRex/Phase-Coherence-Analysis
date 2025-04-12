@@ -1,46 +1,72 @@
 # config.py
 """Configuration parameters for the signal stitching pipeline."""
+import os # Needed if using relative path construction
+
+# --- VVVVV REMOVED LOGGING SETUP FROM CONFIG VVVVV ---
+# import logging
+# logger = logging.getLogger(__name__)
+# logger.debug(...) etc. - REMOVE ALL LOGGER CALLS
+# --- ^^^^^ REMOVED LOGGING SETUP FROM CONFIG ^^^^^ ---
+
 
 # --- Input File ---
+# Make sure this points to the HDF5 file generated WITH the pilot tone
 INPUT_FILENAME = "simulated_chunks_25GHz_400MHzBW_qam16_sdr56MHz.h5"
+# Example using relative path from config.py location:
+# Assumes Reconstruction Module is one level down from the project root
+# and Simulated_data is also one level down from the project root.
+# _SCRIPT_DIR = os.path.dirname(__file__)
+# _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, '..'))
+# _DATA_DIR = os.path.join(_PROJECT_ROOT, 'Simulated_data')
+# _FILENAME_ONLY = "simulated_chunks_25GHz_400MHzBW_qam16_sdr56MHz.h5" # Ensure this exists
+# if os.path.exists(os.path.join(_DATA_DIR, _FILENAME_ONLY)):
+#      INPUT_FILENAME = os.path.join(_DATA_DIR, _FILENAME_ONLY)
+# else:
+#      # Fallback or error if file not found in expected relative location
+#      print(f"WARNING: Could not find data file at relative path: {os.path.join(_DATA_DIR, _FILENAME_ONLY)}")
+#      # Keep the original INPUT_FILENAME or raise an error
+#      pass
+
 
 # --- Processing Parameters ---
 STITCHING_WINDOW_TYPE = 'blackmanharris'
-EXPECTED_RMS = 1.39e-02 # Target RMS after initial scaling and for pre/post stitching normalization
+EXPECTED_RMS = 1.39e-02 # Target RMS
 
 # --- Upsampling Parameters ---
-# (Specific parameters like filter choice are often kept within the function)
-PLOT_FIRST_UPSAMPLED = True # Flag to plot the first chunk after upsampling
+PLOT_FIRST_UPSAMPLED = False # Set to False to avoid plot popup during runs
 
 # --- Phase Correction Parameters ---
-EFFECTIVE_OVERLAP_FACTOR_CORR = 0.25 # Minimum overlap used for phase correlation step
-CORRELATION_MAX_LAG_FRACTION = 0.1 # Fraction of overlap samples to search for time lag
-CORRELATION_MAX_LAG_ABS = 100     # Absolute maximum lag samples to search
+EFFECTIVE_OVERLAP_FACTOR_CORR = 0.25 # Overlap factor used for pilot extraction & stitching
+# Lag parameters are NOT used by pilot tone method
+# CORRELATION_MAX_LAG_FRACTION = 0.1 # Can be commented out
+# CORRELATION_MAX_LAG_ABS = 100      # Can be commented out
+
+# --- Pilot Tone Config ---
+EXPECTED_PILOT_IN_DATA = True
+PILOT_FFT_FACTOR = 4 # Factor for FFT zero-padding (e.g., 4)
 
 # --- WPD Parameters ---
+APPLY_WPD_CORRECTION = False # CONTROL WPD: Set True/False as needed
 WPD_WAVELET = 'db4'
 WPD_LEVEL = 4
-# NOTE: WPD implementation is currently for intra-chunk detrending and had issues.
-APPLY_WPD_CORRECTION = False # Set to False to easily skip the WPD step
+
 
 # --- Stitching Parameters ---
-# Stitching uses the effective overlap calculated based on CORR factor for consistency
-# STITCHING_OVERLAP_FACTOR is derived from EFFECTIVE_OVERLAP_FACTOR_CORR in main script
+# (No specific separate config needed)
+
 
 # --- Evaluation & Visualization ---
-PLOT_LENGTH = 5000      # Number of samples for time-domain plots
-SPECTRUM_YLIM_BOTTOM = -100 # Bottom Y-limit for spectrum plot (dB)
-EVAL_MIN_RELIABLE_SAMPLES = 10 # Minimum samples needed for metrics
+PLOT_LENGTH = 5000
+SPECTRUM_YLIM_BOTTOM = -120
+EVAL_MIN_RELIABLE_SAMPLES = 10
 
-# --- Boundary Cancellation Parame  ters ---
-BOUNDARY_MU = 1e-4           # Step size for boundary LMS (tune this!)
-BOUNDARY_TAPS = 11           # Filter taps for boundary cancellation (odd)
-BOUNDARY_ITER_PER_SAMPLE = 5 # Number of LMS updates per overlap sample
 
 # --- Adaptive Equalizer Parameters ---
-APPLY_LMS_EQUALIZER = False   # Set to True to enable, False to disable
-LMS_NUM_TAPS = 21            # Number of equalizer taps (e.g., 11, 21, 31 - MUST BE ODD)
-LMS_MU = 1e-6                # LMS/CMA step size (LEARNING RATE) - START VERY SMALL for CMA (e.g., 1e-6, 1e-7)
+# Set True/False depending on whether you want to run the post-stitch equalizer
+APPLY_LMS_EQUALIZER = True # Set to False when testing pilot/WPD alone
+LMS_NUM_TAPS = 21
+LMS_MU = 1e-6 # Start very small if APPLY_LMS_EQUALIZER is True
+
 
 # --- Debugging Flags ---
-SKIP_ADAPTIVE_FILTERING = False # As per the original script's logic
+SKIP_ADAPTIVE_FILTERING = True # Keep False if you want to simulate it
