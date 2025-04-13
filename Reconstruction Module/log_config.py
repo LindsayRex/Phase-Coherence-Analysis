@@ -21,6 +21,10 @@ When you run the script, log_config.setup_logging(level=...) sets the playback v
     level=logging.INFO means "only play back normal speech and louder (shouts, alarms)". Whispers (DEBUG) are ignored.
     level=logging.DEBUG means "play back everything, from whispers to alarms".
 
+    documentation generation tools (like Sphinx). Writing good docstrings is a crucial part
+    of writing maintainable and understandable Python code
+
+    
 """
 
 

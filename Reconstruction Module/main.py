@@ -4,231 +4,180 @@ import numpy as np
 import sys
 import time
 import logging
+from scipy import signal as sig # Needed for resampling GT
 
-# --- Setup Logging (Call setup function from log_config) ---
+# --- Setup Logging ---
 from . import log_config
-# Configure logging level here ONCE for the entire application
-# --- VVVVV CORRECTED LEVEL VVVVV ---
-log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs")
-
+log_config.setup_logging(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 
-# --- Imports for Modules ---
+# --- Imports ---
 from . import config
 from . import data_loader
 from . import preprocessing
-from . import pilot_phase_correction # Using pilot tone approach
-from . import stitching
+from . import pilot_phase_correction
+from . import spectral_stitching # <-- Using this for stitching
 from . import evaluation
 from . import visualization
 from . import utils
-from . import equalizer # Keep import, although likely disabled in config
+from . import equalizer # <--- Need this for CMA
 # --- End Imports ---
 
-# Get logger for this main module
-logger = logging.getLogger(__name__)
 
 def main():
-    """Runs the entire signal stitching and evaluation pipeline."""
-    logger.info("="*50)
-    logger.info(" Starting Reconstruction Pipeline Run ")
-    logger.info("="*50)
-    logger.info(f"Using config file source: {config.__file__}")
+    """Runs the REVISED signal stitching pipeline using FREQUENCY DOMAIN STITCHING."""
+    logger.info("="*50); logger.info(" Starting REVISED Reconstruction Pipeline Run ")
+    logger.info(" Pipeline: Load -> Scale -> PILOT CORR -> FREQ DOMAIN STITCH -> EQUALIZE -> Eval ")
+    logger.info("="*50); logger.info(f"Using config file source: {config.__file__}")
     start_time = time.time()
 
-    # --- Create unique identifier for this run (for plot filenames) ---
     run_timestamp = time.strftime('%Y%m%d_%H%M%S')
-    plot_dir = f"run_plots_{run_timestamp}" # Directory to save plots for this run
-
+    plot_dir = f"run_plots_{run_timestamp}"
 
     # 1. Load Data
     logger.info("--- Step 1: Loading Data ---")
-    logger.info(f"Attempting to load data from: {config.INPUT_FILENAME}")
-    loaded_chunks, loaded_metadata, global_attrs = data_loader.load_data(config.INPUT_FILENAME)
+    loaded_sdr_chunks, loaded_metadata, global_attrs, gt_baseband_sim, gt_sim_rate = data_loader.load_data(config.INPUT_FILENAME)
+    if loaded_sdr_chunks is None or gt_baseband_sim is None: logger.critical("Exiting: Data loading failed."); sys.exit(1)
+    if not data_loader.validate_global_attrs(global_attrs): logger.critical("Exiting: Invalid global attributes."); sys.exit(1)
+    if config.EXPECTED_PILOT_IN_DATA and not global_attrs.get('pilot_tone_added', False): logger.critical(f"Config expects pilot but metadata indicates none."); sys.exit("Regenerate data.")
+    logger.info("Data loading successful.")
 
-    if loaded_chunks is None or not loaded_chunks:
-        logger.critical("Exiting: Data loading failed or returned no chunks.")
-        sys.exit(1)
-    if not data_loader.validate_global_attrs(global_attrs):
-        logger.critical("Exiting: Invalid global attributes found in data file.")
-        sys.exit(1)
+    # Extract parameters
+    sdr_rate = global_attrs.get('sdr_sample_rate_hz'); final_recon_rate = config.FS_RECON_FINAL
+    base_overlap_factor = global_attrs.get('overlap_factor', 0.1); tuning_delay = global_attrs.get('tuning_delay_s', 5e-6)
+    logger.info(f"Extracted rates: SDR={sdr_rate/1e6:.1f} MHz, Target Final={final_recon_rate/1e6:.1f} MHz")
 
-    # Check for pilot tone consistency between config and loaded data
-    if config.EXPECTED_PILOT_IN_DATA and not global_attrs.get('pilot_tone_added', False):
-         logger.critical(f"Config expects pilot (EXPECTED_PILOT_IN_DATA=True) but loaded file metadata indicates none.")
-         sys.exit("Regenerate data with pilot or set EXPECTED_PILOT_IN_DATA=False in config.")
-    elif not config.EXPECTED_PILOT_IN_DATA and global_attrs.get('pilot_tone_added', True):
-         logger.warning(f"Config expects NO pilot (EXPECTED_PILOT_IN_DATA=False) but loaded file contains pilot metadata. Will skip pilot correction.")
-    elif config.EXPECTED_PILOT_IN_DATA:
-         logger.info("Pilot tone expected and metadata confirms presence.")
-    else: # Not expecting pilot, and file doesn't have it (or flag missing)
-         logger.info("Proceeding without pilot tone correction as per config.")
+    # 2. Amplitude Scaling (SDR rate)
+    logger.info(f"--- Step 2: Initial Amplitude Scaling (SDR Rate) ---")
+    sdr_rate_chunks_scaled = preprocessing.scale_chunks(loaded_sdr_chunks, config.EXPECTED_RMS)
+    if sdr_rate_chunks_scaled is None: logger.critical("Exiting: Scaling failed."); sys.exit(1)
 
-    # Extract parameters safely using .get() with defaults
-    sdr_rate = global_attrs.get('sdr_sample_rate_hz')
-    recon_rate = global_attrs.get('ground_truth_sample_rate_hz')
-    base_overlap_factor = global_attrs.get('overlap_factor', 0.1)
-    tuning_delay = global_attrs.get('tuning_delay_s', 5e-6)
-    logger.info(f"Extracted parameters: SDR Rate={sdr_rate/1e6} MHz, Recon Rate={recon_rate/1e6} MHz, Overlap={base_overlap_factor}, Tuning Delay={tuning_delay*1e6} us")
-
-
-    # 2. Initial Amplitude Scaling
-    logger.info("--- Step 2: Initial Amplitude Scaling ---")
-    scaled_chunks = preprocessing.scale_chunks(loaded_chunks, config.EXPECTED_RMS)
-    if scaled_chunks is None:
-        logger.critical("Exiting: Critical error during initial scaling.")
-        sys.exit(1)
-    current_chunks = scaled_chunks
-
-
-    # 3. Skip Adaptive Filtering (Placeholder)
-    if config.SKIP_ADAPTIVE_FILTERING:
-        logger.info("--- Step 3: Skipping Adaptive Filtering Pre-Alignment (Config Flag) ---")
-
-
-    # 4. Upsampling
-    logger.info("--- Step 4: Upsampling Chunks ---")
-    upsampled_chunks = preprocessing.upsample_chunks(
-        current_chunks, sdr_rate, recon_rate, plot_first=config.PLOT_FIRST_UPSAMPLED
-    )
-    current_chunks = upsampled_chunks
-
-
-    # 5. Phase Correction (Pilot Tone + Optional WPD)
-    logger.info("--- Step 5: Phase Correction ---")
-    effective_overlap = max(config.EFFECTIVE_OVERLAP_FACTOR_CORR, base_overlap_factor) # Used for stitching too
-    logger.info(f"Using effective overlap factor: {effective_overlap:.3f}")
-
+    # 3. Pilot Phase Correction (SDR rate)
+    logger.info("--- Step 3: Phase Correction (SDR Rate) ---")
+    effective_overlap_pilot = max(config.EFFECTIVE_OVERLAP_FACTOR_CORR, base_overlap_factor)
+    corrected_sdr_chunks = sdr_rate_chunks_scaled
     if config.EXPECTED_PILOT_IN_DATA:
-        logger.info("Calling pilot tone phase correction...")
-        corrected_chunks, estimated_phases = pilot_phase_correction.correct_phase_pilot_tone(
-            current_chunks, # Pass upsampled chunks now
-            loaded_metadata,
-            global_attrs,
-            apply_wpd=config.APPLY_WPD_CORRECTION,
-            wavelet=config.WPD_WAVELET,
-            wpd_level=config.WPD_LEVEL,
-            n_fft_factor_pilot=config.PILOT_FFT_FACTOR
+        corrected_sdr_chunks, estimated_phases = pilot_phase_correction.correct_phase_pilot_tone(
+            sdr_rate_chunks_scaled, loaded_metadata, global_attrs,
+            apply_wpd=config.APPLY_WPD_CORRECTION, wavelet=config.WPD_WAVELET,
+            wpd_level=config.WPD_LEVEL, n_fft_factor_pilot=config.PILOT_FFT_FACTOR
         )
-        if corrected_chunks is None or len(corrected_chunks) != len(upsampled_chunks):
-            logger.error("Pilot/WPD phase correction failed. Proceeding with uncorrected upsampled chunks.")
-            current_chunks = upsampled_chunks # Fallback
-        else:
-            logger.info("Pilot tone phase correction (and optional WPD) applied.")
-            current_chunks = corrected_chunks
-            # Log estimated phases for analysis
-            logger.debug("Estimated Cumulative Phases (radians):")
-            for i, ph in enumerate(estimated_phases): logger.debug(f"  Chunk {i}: {ph:.4f}")
-    else:
-         logger.info("Skipping Pilot Tone Phase Correction (as per config)")
-         if config.APPLY_WPD_CORRECTION:
-              logger.info("Applying WPD correction independently to upsampled chunks...")
-              # Call WPD function directly (it's defined in pilot_phase_correction module)
-              wpd_corrected_chunks = pilot_phase_correction.correct_phase_wpd(
-                   current_chunks, wavelet=config.WPD_WAVELET, level=config.WPD_LEVEL
-              )
-              current_chunks = wpd_corrected_chunks
-         else: logger.info("Skipping WPD Correction (as per config)")
+        if corrected_sdr_chunks is None: logger.critical("Exiting: Pilot correction failed."); sys.exit(1)
+    else: logger.info("Skipping pilot correction.")
+    if config.APPLY_WPD_CORRECTION and config.EXPECTED_PILOT_IN_DATA: logger.info("WPD applied within pilot correction step.")
+    elif config.APPLY_WPD_CORRECTION: logger.info("WPD applied independently (no pilot).")
+    else: logger.info("WPD skipped.")
 
 
-    # 6. WPD Step (Now integrated into step 5)
-    logger.info("--- Step 6: WPD (Integrated within Step 5 if enabled) ---")
-
-
-    # 7. Pre-Stitching Normalization
-    logger.info("--- Step 7: Pre-Stitching Normalization ---")
-    normalized_chunks_stitch = stitching.normalize_chunks_pre_stitch(
-        current_chunks, config.EXPECTED_RMS
+    # 4. Frequency Domain Stitching
+    logger.info(f"--- Step 4: Frequency Domain Stitching (Output Rate: {final_recon_rate/1e6:.1f} MHz) ---")
+    stitched_signal_unnormalized = spectral_stitching.frequency_domain_stitch(
+        sdr_rate_chunks=corrected_sdr_chunks, metadata=loaded_metadata, global_attrs=global_attrs,
+        fs_recon_final=final_recon_rate, freq_domain_window=config.STITCHING_WINDOW_TYPE,
+        target_rms=None # Do final RMS scaling *after* equalizer if enabled
     )
+    if stitched_signal_unnormalized is None: logger.critical("Exiting: Frequency domain stitching failed."); sys.exit(1)
+    logger.info(f"Frequency domain stitching complete. Output len: {len(stitched_signal_unnormalized)}")
 
-
-    # 8. Stitching
-    logger.info("--- Step 8: Stitching Signal ---")
-    chunk_duration_s = 0
-    if len(loaded_chunks) > 0 and sdr_rate > 0: chunk_duration_s = len(loaded_chunks[0]) / sdr_rate
-    elif len(normalized_chunks_stitch) > 0 and recon_rate > 0: chunk_duration_s = len(normalized_chunks_stitch[0]) / recon_rate; logger.warning("Using processed chunk length for stitching duration estimate.")
-    if chunk_duration_s <= 0: logger.warning("Could not determine chunk duration for stitching.")
-
-    raw_stitched_signal, sum_windows = stitching.stitch_signal(
-        normalized_chunks_stitch, sdr_rate, recon_rate, effective_overlap, tuning_delay, config.STITCHING_WINDOW_TYPE
-    )
-    if raw_stitched_signal is None: logger.critical("Exiting due to stitching error."); sys.exit(1)
-
-
-    # 9. Post-Stitching Normalization
-    logger.info("--- Step 9: Post-Stitching Normalization ---")
-    final_stitched_signal = stitching.normalize_stitched_signal(
-        raw_stitched_signal, sum_windows, config.EXPECTED_RMS
-    )
-    if final_stitched_signal is None: logger.critical("Exiting due to post-stitching normalization error."); sys.exit(1)
-
-
-    # 10. Adaptive Equalizer (Check if enabled)
-    logger.info("--- Step 10: Post-Stitch Adaptive Equalization ---")
-    signal_for_evaluation = final_stitched_signal # Default to signal before EQ
+    # --- VVVVV STEP 5: Adaptive Equalizer (Optional) VVVVV ---
+    logger.info("--- Step 5: Post-Stitch Adaptive Equalization ---")
+    signal_after_eq = stitched_signal_unnormalized # Start with stitcher output
     if config.APPLY_LMS_EQUALIZER:
-        if config.EXPECTED_PILOT_IN_DATA:
-             logger.warning("Running Post-stitch equalizer even though pilot tone correction was applied. Check config.")
-        # Define constellation for CMA R2 calculation (if needed)
+        if config.EXPECTED_PILOT_IN_DATA: logger.warning("Running Post-stitch equalizer after pilot tone correction.")
+        # Define constellation for CMA R2 calculation
         qam16_points = np.array([ (r + 1j*i) / np.sqrt(10) for r in [-3,-1,1,3] for i in [-3,-1,1,3] ])
-        equalized_signal = equalizer.cma_equalizer(
-            signal_for_evaluation, config.LMS_NUM_TAPS, config.LMS_MU, constellation=qam16_points
+        signal_after_eq = equalizer.cma_equalizer(
+            stitched_signal_unnormalized, # Input the signal BEFORE final RMS scaling
+            config.LMS_NUM_TAPS, config.LMS_MU, constellation=qam16_points
         )
-        if equalized_signal is not None and len(equalized_signal)>0:
-             rms_after_eq = np.sqrt(np.mean(np.abs(equalized_signal)**2))
-             logger.info(f"RMS after CMA Equalization: {rms_after_eq:.4e} (Target was {config.EXPECTED_RMS:.4e})")
-             signal_for_evaluation = equalized_signal # Use the equalized signal
+        if signal_after_eq is None or len(signal_after_eq)==0:
+             logger.error("Equalizer failed or returned empty. Using signal before equalization.")
+             signal_after_eq = stitched_signal_unnormalized # Fallback
         else:
-             logger.warning("Equalizer failed or returned empty. Using signal before equalization.")
+             logger.info("CMA equalization applied.")
     else:
         logger.info("Skipping Post-Stitch CMA Equalization (as per config).")
+    # --- ^^^^^ END STEP 5 ^^^^^ ---
 
 
-    # 11. Evaluation
-    logger.info("--- Step 11: Evaluation ---")
-    total_recon_duration = 0.0; gt_signal=None; t_vector=None
-    if signal_for_evaluation is not None and recon_rate > 0: total_recon_duration = len(signal_for_evaluation) / recon_rate
-    if total_recon_duration > 0: gt_signal, t_vector = evaluation.regenerate_ground_truth(global_attrs, total_recon_duration, recon_rate, config.EXPECTED_RMS)
-    metrics = {'mse': np.inf, 'nmse': np.inf, 'evm': np.inf}; recon_signal_aligned_for_plot = signal_for_evaluation
-    reliable_indices_eval = np.array([]); max_len_reliable=0
-    if sum_windows is not None: max_len_reliable = len(signal_for_evaluation) if signal_for_evaluation is not None else 0
-    if sum_windows is not None and max_len_reliable > 0: reliable_indices_eval = np.where(sum_windows >= 1e-6)[0]; reliable_indices_eval = reliable_indices_eval[reliable_indices_eval < max_len_reliable]
-    if gt_signal is not None and signal_for_evaluation is not None:
-        metrics, recon_signal_aligned_for_plot = evaluation.calculate_metrics(gt_signal, signal_for_evaluation, reliable_indices_eval, config.EVAL_MIN_RELIABLE_SAMPLES)
-    else: logger.warning("Skipping metrics calculation due to invalid GT or reconstructed signal.")
-
-
-    # 12. Visualization
-    logger.info("--- Step 12: Visualization ---")
-    if t_vector is not None and gt_signal is not None and recon_signal_aligned_for_plot is not None:
-        logger.info("Generating plots...")
-        # Pass the unique run timestamp to group plots
-        visualization.plot_time_domain(
-            t_vector, gt_signal, recon_signal_aligned_for_plot,
-            config.EXPECTED_RMS, metrics['evm'], config.PLOT_LENGTH,
-            filename_suffix=f"run_{run_timestamp}", plot_dir=plot_dir
-        )
-        visualization.plot_spectrum(
-            gt_signal, recon_signal_aligned_for_plot,
-            recon_rate, config.SPECTRUM_YLIM_BOTTOM,
-            filename_suffix=f"run_{run_timestamp}", plot_dir=plot_dir
-        )
-        visualization.plot_constellation(
-            gt_signal, title="Ground Truth Constellation",
-            filename_suffix=f"gt_{run_timestamp}", plot_dir=plot_dir
-        )
-        # Plot constellation *before* alignment might be useful too
-        visualization.plot_constellation(
-             signal_for_evaluation, title=f"Reconstructed Constellation (Final Eval Input)",
-             filename_suffix=f"recon_eval_input_{run_timestamp}", plot_dir=plot_dir
-        )
-        visualization.plot_constellation(
-            recon_signal_aligned_for_plot, title=f"Reconstructed Constellation (Plot Aligned, EVM={metrics['evm']:.2f}%)",
-            filename_suffix=f"recon_aligned_{run_timestamp}", plot_dir=plot_dir
-        )
-        logger.info(f"Plots saved to directory: {plot_dir}")
+    # --- VVVVV STEP 6: Final RMS Scaling VVVVV ---
+    logger.info("--- Step 6: Final RMS Scaling ---")
+    # Apply final scaling to the output of the equalizer (or stitcher if EQ skipped)
+    rms_before_final_scale = np.sqrt(np.mean(np.abs(signal_after_eq)**2)) if len(signal_after_eq) > 0 else 0.0
+    logger.info(f"RMS before final scaling: {rms_before_final_scale:.4e}")
+    final_signal = signal_after_eq.copy() # Make a copy
+    if rms_before_final_scale > 1e-15:
+         final_scale_factor = config.EXPECTED_RMS / rms_before_final_scale
+         final_signal *= final_scale_factor
+         logger.info(f"Applied final scaling factor {final_scale_factor:.4f} to match target RMS ({config.EXPECTED_RMS:.4e}).")
+         # Verify final RMS
+         rms_final_check = np.sqrt(np.mean(np.abs(final_signal)**2))
+         logger.info(f"Final RMS after scaling: {rms_final_check:.4e}")
     else:
-        logger.warning("Skipping plots generation due to invalid input signals or time vector.")
+         logger.warning("Signal RMS near zero before final scaling. Scaling skipped.")
+         final_signal.fill(0) # Zero out if no power
+    # --- ^^^^^ END STEP 6 ^^^^^ ---
+
+
+    # --- VVVVV STEP 7: Evaluation VVVVV ---
+    logger.info("--- Step 7: Evaluation ---")
+    signal_for_evaluation = final_signal # Use the final scaled signal
+    gt_signal_eval_rate = None; t_vector = None; metrics = {'mse': np.inf, 'nmse': np.inf, 'evm': np.inf}
+    recon_signal_aligned_for_plot = signal_for_evaluation # Default
+
+    if signal_for_evaluation is not None and final_recon_rate > 0:
+        total_recon_duration = len(signal_for_evaluation) / final_recon_rate
+        logger.info(f"Evaluating signal: Duration={total_recon_duration*1e6:.1f} us, Rate={final_recon_rate/1e6:.1f} MHz.")
+        # Resample Ground Truth
+        logger.info("Resampling loaded Ground Truth Baseband...")
+        if gt_sim_rate == final_recon_rate: gt_signal_eval_rate = gt_baseband_sim
+        else:
+             try:
+                  gt_sim_rate_int = int(np.round(gt_sim_rate)); final_recon_rate_int = int(np.round(final_recon_rate))
+                  common = np.gcd(final_recon_rate_int, gt_sim_rate_int); up = final_recon_rate_int // common; down = gt_sim_rate_int // common
+                  logger.debug(f"GT Resampling: Up={up}, Down={down}")
+                  gt_real = sig.resample_poly(gt_baseband_sim.real.astype(np.float64), up, down)
+                  gt_imag = sig.resample_poly(gt_baseband_sim.imag.astype(np.float64), up, down)
+                  gt_signal_eval_rate = (gt_real + 1j * gt_imag).astype(np.complex128)
+             except Exception as e: logger.error(f"Error resampling GT: {e}"); gt_signal_eval_rate = None
+        # Adjust length and normalize resampled GT
+        if gt_signal_eval_rate is not None:
+             num_samples_eval = len(signal_for_evaluation); current_len = len(gt_signal_eval_rate)
+             if current_len > num_samples_eval: gt_signal_eval_rate = gt_signal_eval_rate[:num_samples_eval]
+             elif current_len < num_samples_eval: gt_signal_eval_rate = np.pad(gt_signal_eval_rate,(0,num_samples_eval-current_len))
+             gt_rms = np.sqrt(np.mean(np.abs(gt_signal_eval_rate)**2))
+             if gt_rms > 1e-15: gt_signal_eval_rate *= (config.EXPECTED_RMS / gt_rms)
+             else: logger.warning("Resampled GT zero RMS."); gt_signal_eval_rate.fill(0)
+             logger.info(f"Resampled GT adjusted: Len={len(gt_signal_eval_rate)}, RMS={config.EXPECTED_RMS:.2e}")
+             t_vector = np.linspace(0, total_recon_duration, len(gt_signal_eval_rate), endpoint=False) if len(gt_signal_eval_rate)>0 else np.array([])
+        else: logger.error("GT signal unavailable for evaluation.")
+    else: logger.warning("Cannot evaluate due to invalid signal or rate.")
+
+    # Calculate metrics
+    if gt_signal_eval_rate is not None and signal_for_evaluation is not None:
+        if len(gt_signal_eval_rate) != len(signal_for_evaluation): logger.error("Length mismatch GT vs Recon for metrics.")
+        else:
+             # Assuming all samples are reliable after freq domain stitching
+             reliable_indices_eval = np.arange(len(signal_for_evaluation))
+             logger.debug(f"Calculating metrics using {len(reliable_indices_eval)} indices.")
+             metrics, recon_signal_aligned_for_plot = evaluation.calculate_metrics(gt_signal_eval_rate, signal_for_evaluation, reliable_indices_eval, config.EVAL_MIN_RELIABLE_SAMPLES)
+    else: logger.warning("Skipping metrics calculation.")
+    # --- ^^^^^ END STEP 7 ^^^^^ ---
+
+
+    # --- VVVVV STEP 8: Visualization VVVVV ---
+    logger.info("--- Step 8: Visualization ---")
+    if t_vector is not None and gt_signal_eval_rate is not None and recon_signal_aligned_for_plot is not None:
+        logger.info(f"Generating plots at final rate {final_recon_rate/1e6:.1f} MHz...")
+        visualization.plot_time_domain(t_vector, gt_signal_eval_rate, recon_signal_aligned_for_plot, config.EXPECTED_RMS, metrics['evm'], config.PLOT_LENGTH, filename_suffix=f"run_{run_timestamp}", plot_dir=plot_dir)
+        visualization.plot_spectrum(gt_signal_eval_rate, recon_signal_aligned_for_plot, final_recon_rate, config.SPECTRUM_YLIM_BOTTOM, filename_suffix=f"run_{run_timestamp}", plot_dir=plot_dir)
+        visualization.plot_constellation(gt_signal_eval_rate, title="Ground Truth Constellation (Resampled)", filename_suffix=f"gt_resampled_{run_timestamp}", plot_dir=plot_dir)
+        visualization.plot_constellation(signal_for_evaluation, title=f"Reconstructed Constellation (Before Align)", filename_suffix=f"recon_final_{run_timestamp}", plot_dir=plot_dir)
+        visualization.plot_constellation(recon_signal_aligned_for_plot, title=f"Reconstructed Constellation (Plot Aligned, EVM={metrics['evm']:.2f}%)", filename_suffix=f"recon_aligned_{run_timestamp}", plot_dir=plot_dir)
+        logger.info(f"Plots saved to directory: {plot_dir}")
+    else: logger.warning("Skipping plots generation.")
+    # --- ^^^^^ END STEP 8 ^^^^^ ---
 
 
     end_time = time.time()
@@ -236,12 +185,6 @@ def main():
     logger.info("--- Reconstruction Pipeline Finished ---")
     logger.info("="*50)
 
-# Configure logging when the script is imported or run
-# Moved setup call outside main to ensure logger is ready
-log_config.setup_logging(level=logging.DEBUG, log_dir="run_logs") # Default to INFO
 
 if __name__ == "__main__":
-    # Optionally override log level from command line?
-    # if len(sys.argv) > 1 and sys.argv[1].upper() == 'DEBUG':
-    #     log_config.setup_logging(level=logging.DEBUG)
     main()
