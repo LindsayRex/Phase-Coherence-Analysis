@@ -165,11 +165,14 @@ ModRec_Research/
 share/
 Scripts/
 archive/
-
+results/
 
 # Exclude the Folder contents 
 simulated_data/*
 !simulated_data/
+
+logs/*
+!logs/
 
 run_logs/*
 !run_logs/
