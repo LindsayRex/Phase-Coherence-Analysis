@@ -1,72 +1,58 @@
 # config.py
 """Configuration parameters for the signal stitching pipeline."""
-import os # Needed if using relative path construction
-
-# --- VVVVV REMOVED LOGGING SETUP FROM CONFIG VVVVV ---
-# import logging
-# logger = logging.getLogger(__name__)
-# logger.debug(...) etc. - REMOVE ALL LOGGER CALLS
-# --- ^^^^^ REMOVED LOGGING SETUP FROM CONFIG ^^^^^ ---
-
+import os
 
 # --- Input File ---
 # Make sure this points to the HDF5 file generated WITH the pilot tone
+# AND containing the ground_truth_baseband dataset.
 INPUT_FILENAME = "simulated_chunks_25GHz_400MHzBW_qam16_sdr56MHz.h5"
-# Example using relative path from config.py location:
-# Assumes Reconstruction Module is one level down from the project root
-# and Simulated_data is also one level down from the project root.
-# _SCRIPT_DIR = os.path.dirname(__file__)
-# _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, '..'))
-# _DATA_DIR = os.path.join(_PROJECT_ROOT, 'Simulated_data')
-# _FILENAME_ONLY = "simulated_chunks_25GHz_400MHzBW_qam16_sdr56MHz.h5" # Ensure this exists
-# if os.path.exists(os.path.join(_DATA_DIR, _FILENAME_ONLY)):
-#      INPUT_FILENAME = os.path.join(_DATA_DIR, _FILENAME_ONLY)
-# else:
-#      # Fallback or error if file not found in expected relative location
-#      print(f"WARNING: Could not find data file at relative path: {os.path.join(_DATA_DIR, _FILENAME_ONLY)}")
-#      # Keep the original INPUT_FILENAME or raise an error
-#      pass
-
 
 # --- Processing Parameters ---
-STITCHING_WINDOW_TYPE = 'blackmanharris'
-EXPECTED_RMS = 1.39e-02 # Target RMS
+STITCHING_WINDOW_TYPE = 'blackmanharris'  # or hann
+EXPECTED_RMS = 1.39e-02 # Target RMS for scaling chunks and final signal
 
-# --- Upsampling Parameters ---
-PLOT_FIRST_UPSAMPLED = False # Set to False to avoid plot popup during runs
+# --- VVVVV Final Reconstruction Sample Rate VVVVV ---
+# This is the target sample rate for the final stitched signal and for evaluation
+# Should be >= Nyquist for the total signal bandwidth (e.g., > 800 MHz for 400 MHz BW)
+# Using 1.0 GHz as a reasonable value, much lower than the old 3.6 GHz GT rate.
+FS_RECON_FINAL = 3613200000.0 # Hz (e.g., 1.0 GHz)
+# --- ^^^^^ Final Reconstruction Sample Rate ^^^^^ ---
+
+# --- Upsampling Parameters (for initial plot only) ---
+PLOT_FIRST_UPSAMPLED = False # Plot of first chunk after upsampling to FS_RECON_FINAL
 
 # --- Phase Correction Parameters ---
 EFFECTIVE_OVERLAP_FACTOR_CORR = 0.25 # Overlap factor used for pilot extraction & stitching
-# Lag parameters are NOT used by pilot tone method
-# CORRELATION_MAX_LAG_FRACTION = 0.1 # Can be commented out
-# CORRELATION_MAX_LAG_ABS = 100      # Can be commented out
+# Lag parameters are NOT used by pilot tone method, only by old correlation method
+# CORRELATION_MAX_LAG_FRACTION = 0.1
+# CORRELATION_MAX_LAG_ABS = 100
 
 # --- Pilot Tone Config ---
-EXPECTED_PILOT_IN_DATA = True
-PILOT_FFT_FACTOR = 4 # Factor for FFT zero-padding (e.g., 4)
+EXPECTED_PILOT_IN_DATA = True # Must be True if INPUT_FILENAME contains pilot
+PILOT_FFT_FACTOR = 4 # Zero-padding factor for FFT in pilot extraction
 
 # --- WPD Parameters ---
-APPLY_WPD_CORRECTION = False # CONTROL WPD: Set True/False as needed
+APPLY_WPD_CORRECTION = True # Control WPD step after pilot correction
 WPD_WAVELET = 'db4'
 WPD_LEVEL = 4
 
-
 # --- Stitching Parameters ---
-# (No specific separate config needed)
-
+# (No specific separate config needed, uses EFFECTIVE_OVERLAP_FACTOR_CORR)
 
 # --- Evaluation & Visualization ---
-PLOT_LENGTH = 5000
-SPECTRUM_YLIM_BOTTOM = -120
-EVAL_MIN_RELIABLE_SAMPLES = 10
-
+PLOT_LENGTH = 5000 # Samples to use for time-domain plots
+SPECTRUM_YLIM_BOTTOM = -140 # dB limit for spectrum plots (adjust as needed)
+EVAL_MIN_RELIABLE_SAMPLES = 10 # Min samples for reliable metrics
 
 # --- Adaptive Equalizer Parameters ---
-# Set True/False depending on whether you want to run the post-stitch equalizer
-APPLY_LMS_EQUALIZER = True # Set to False when testing pilot/WPD alone
-LMS_NUM_TAPS = 21
-LMS_MU = 1e-6 # Start very small if APPLY_LMS_EQUALIZER is True
+# Set False to test the Pilot+WPD approach without subsequent equalization
+APPLY_LMS_EQUALIZER = True
+LMS_NUM_TAPS = 21 # (Not used if APPLY_LMS_EQUALIZER is False)
+LMS_MU = 1e-7    # (Not used if APPLY_LMS_EQUALIZER is False)
 
 
 # --- Debugging Flags ---
-SKIP_ADAPTIVE_FILTERING = True # Keep False if you want to simulate it
+# SKIP_ADAPTIVE_FILTERING: This name might be misleading now.
+# It originally referred to a potential pre-processing filter step.
+# Let's keep it, but ensure it doesn't conflict with other steps.
+SKIP_ADAPTIVE_FILTERING = True # Set based on whether any pre-filter was intended
