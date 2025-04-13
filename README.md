@@ -18,7 +18,7 @@ To reconstruct the 400MHz signal with the reconstruction module using wavelets:
 
 **Background: ** 
 Research suggests wavelets could be adapted for reconstructing wideband signals from narrowband chunks, addressing phase coherence 
-through decomposition and alignment, but no direct examples exist for SDRs. The evidence leans toward your idea being innovative, 
+through decomposition and alignment, but no direct examples exist for SDRs. The evidence leans toward the  idea being innovative, 
 as most related work focuses on speech or other domains, not SDRs with limited bandwidth. This presents an opportunity for novel research,
 potentially leveraging wavelet packet decomposition and inverse transforms to ensure phase coherence, though practical implementation 
 would require addressing SDR-specific challenges like oscillator drift.
