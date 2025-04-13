@@ -1,256 +1,295 @@
-# phase_correction.py
-"""Functions for correcting phase discontinuities between chunks using GPU."""
+# pilot_phase_correction.py
+"""
+Performs phase correction using Wavelet Packet Decomposition based alignment
+and optionally removes the pilot tone using a notch filter.
+Optimized for GPU acceleration where available (CuPy/cuSignal).
+Removes old/fallback logic, focusing on the WPD-based approach.
+"""
 
 import numpy as np
 from tqdm import tqdm
 import pywt
 import sys
-import logging # Import standard logging
+import logging
+from scipy.signal import iirnotch, filtfilt # Using SciPy filtfilt for CPU/fallback
 
-# --- Get logger for this module ---
+# Import config settings directly
+from . import config
+
+# Setup logging for this module
 logger = logging.getLogger(__name__)
-# --- End Get logger ---
-# DO NOT call log_config.setup_logging() here
 
-# --- CuPy Import and Check ---
-cupy_available = False # Default to False
+# --- CuPy/cuSignal Import and Check ---
+cupy_available = False
+cusignal_available = False
 try:
     import cupy as cp
     try:
-        cp.cuda.Device(0).use()
+        cp.cuda.Device(0).use() # Check GPU availability
         cupy_available = True
-        logger.info("CuPy found and GPU available. Using GPU acceleration for correlation.")
-    except cp.cuda.runtime.CUDARuntimeError as e:
-        logger.warning(f"CuPy found, but GPU unavailable/error: {e}. Correlation cannot use GPU.")
-    except Exception as e_init:
-         logger.warning(f"CuPy found, but error during GPU init: {e_init}. Correlation cannot use GPU.")
+        try:
+            import cusignal # Check for cuSignal
+            cusignal_available = True
+            logger.info("CuPy/GPU and cuSignal available. Enabling GPU acceleration.")
+        except ImportError:
+            logger.info("CuPy/GPU available but cuSignal not found. Notch filter on CPU.")
+    except Exception as e_gpu:
+        logger.warning(f"CuPy found, but GPU unavailable/error: {e_gpu}. Processing on CPU.")
 except ImportError:
-    logger.warning("CuPy not found. Correlation will run on CPU using NumPy.")
-# --- End CuPy Import ---
+    logger.warning("CuPy not found. Processing on CPU using NumPy.")
+# --- End CuPy/cuSignal Import ---
 
 
-def correct_phase_correlation(chunks, sdr_rate, recon_rate, base_overlap_factor, min_overlap_factor, max_lag_fraction, max_lag_abs):
+def _determine_wpd_pilot_path(sdr_rate, pilot_freq, overlap_samples, wpd_wavelet, wpd_level):
+    """Helper to find the WPD node path closest to the pilot frequency."""
+    try:
+        freq_res = sdr_rate / (2**(wpd_level + 1)) # Approx center freq resolution
+        # Dummy decomposition on CPU to get node paths
+        wp_dummy = pywt.WaveletPacket(data=np.zeros(overlap_samples), wavelet=wpd_wavelet, mode='symmetric', maxlevel=wpd_level)
+        nodes = wp_dummy.get_level(wpd_level, 'freq')
+        # Calculate approximate center frequency for each terminal node
+        node_freqs = []
+        valid_paths = []
+        for node in nodes:
+             # Check if it's a terminal node at the desired level
+             if node.path and len(node.path) == wpd_level:
+                 # Calculate frequency based on path ('a'=0, 'd'=1 -> binary)
+                 # This is an approximation, actual coverage depends on wavelet filters
+                 try:
+                     binary_repr = node.path.replace('a','0').replace('d','1')
+                     node_index = int(binary_repr, 2)
+                     # Center frequency approx based on index and resolution
+                     # This assumes standard frequency ordering, adjust if needed for pywt
+                     center_freq = node_index * freq_res + freq_res / 2.0 # Midpoint of bin
+                     node_freqs.append(center_freq)
+                     valid_paths.append(node.path)
+                 except ValueError:
+                      logger.debug(f"Could not interpret node path '{node.path}' as binary.")
+                      continue # Skip nodes with unexpected paths
+
+        if not node_freqs:
+            logger.error("Could not extract node frequencies from dummy WPD.")
+            return None, np.nan
+
+        node_freqs = np.array(node_freqs)
+        # Find the path corresponding to the minimum absolute difference
+        pilot_bin_idx = np.argmin(np.abs(node_freqs - pilot_freq))
+        pilot_subband_path = valid_paths[pilot_bin_idx]
+        actual_bin_freq = node_freqs[pilot_bin_idx]
+        logger.info(f"Target Pilot Freq: {pilot_freq/1e6:.3f} MHz. Using WPD node: '{pilot_subband_path}' near {actual_bin_freq/1e6:.3f} MHz (Res: {freq_res/1e6:.3f} MHz)")
+        return pilot_subband_path, actual_bin_freq
+    except Exception as e:
+        logger.error(f"Error determining WPD pilot subband: {e}", exc_info=True)
+        return None, np.nan
+
+
+def perform_phase_correction(chunks_in, metadata, global_attrs):
     """
-    Corrects chunk phases using GPU-accelerated time-domain cross-correlation
-    with lag estimation and phasor averaging for phase estimation.
+    Main function to perform phase correction and pilot removal.
 
     Args:
-        chunks (list): List of upsampled chunk data (complex128 numpy arrays).
-        sdr_rate (float): Original SDR sample rate (Hz).
-        recon_rate (float): Sample rate of the input chunks (Hz).
-        base_overlap_factor (float): Original overlap factor from metadata.
-        min_overlap_factor (float): Minimum overlap factor to use for correlation.
-        max_lag_fraction (float): Max lag as fraction of overlap samples.
-        max_lag_abs (int): Absolute max lag samples.
+        chunks_in (list): List of chunk data (NumPy complex128 arrays) AT SDR RATE.
+        metadata (list): Metadata dictionaries for each chunk.
+        global_attrs (dict): Global attributes dictionary.
 
     Returns:
-        tuple: (corrected_chunks, estimated_cumulative_phases)
-               - corrected_chunks (list): List of numpy arrays (CPU) with phase correction applied.
-               - estimated_cumulative_phases (list): Estimated cumulative phase offset for each chunk (CPU floats).
-               Returns original chunks if GPU correlation cannot proceed.
+        tuple: (processed_chunks, estimated_cumulative_phases)
+               - processed_chunks (list): List of NumPy arrays (CPU) after processing.
+               - estimated_cumulative_phases (list): Estimated cumulative phase offset (CPU floats).
     """
-    logger.info("--- Performing Improved Phase Correlation (Correlation/Phasor Avg) ---") # Renamed slightly
+    logger.info("===== Phase Correction & Pilot Removal Module =====")
+    xp = cp if cupy_available else np
+    use_gpu = cupy_available
+    backend_name = "GPU (CuPy)" if use_gpu else "CPU (NumPy)"
+    logger.info(f"Using backend: {backend_name}")
 
-    # Decide backend based on CuPy availability
-    if cupy_available:
-        logger.info("Using GPU (CuPy) for correlation loop.")
-        xp = cp
-    else:
-        logger.warning("Using CPU (NumPy) for correlation loop. This might be slow.")
-        xp = np
-
-    if not chunks:
-        logger.error("No chunks provided for phase correlation.")
+    # --- Input Validation ---
+    if not chunks_in or not metadata or len(chunks_in) != len(metadata):
+        logger.error("Invalid chunks/metadata. Returning empty lists.")
         return [], []
+    if not global_attrs:
+        logger.error("Global attributes missing. Returning original chunks.")
+        return [np.asarray(c) for c in chunks_in], [0.0] * len(chunks_in)
 
-    # Calculate overlap samples (on CPU)
-    chunk_duration_s = 0
-    if len(chunks) > 0 and recon_rate > 0:
-         chunk_duration_s = len(chunks[0]) / recon_rate
-    elif len(chunks) > 0 and sdr_rate > 0: # Fallback estimate
-         logger.warning("Estimating chunk duration from SDR rate (less accurate).")
-         chunk_duration_s = len(chunks[0]) / sdr_rate
-    else:
-         logger.warning("Cannot determine chunk duration for overlap calc.")
+    num_chunks = len(chunks_in)
+    chunks_cpu = [np.asarray(c, dtype=np.complex128) for c in chunks_in] # Work with CPU arrays initially
+    estimated_cumulative_phases = [0.0] * num_chunks
+    processed_chunks_list = [chunks_cpu[0]] # Start with chunk 0 on CPU
 
-    effective_overlap = max(min_overlap_factor, base_overlap_factor)
-    overlap_samples_recon = int(round(chunk_duration_s * effective_overlap * recon_rate)) if recon_rate is not None else 0
-    logger.info(f"Overlap samples for Correlation: {overlap_samples_recon}")
+    # --- Phase Alignment (WPD-based) ---
+    if config.APPLY_WAVELET_PHASE_ALIGNMENT:
+        logger.info("--- Applying Wavelet Phase Alignment ---")
+        sdr_rate = global_attrs.get('sdr_sample_rate_hz')
+        pilot_freq = global_attrs.get('pilot_offset_hz')
+        overlap_factor = global_attrs.get('overlap_factor', 0.1)
+        wpd_wavelet = config.WPD_WAVELET_ALIGN
+        wpd_level = config.WPD_LEVEL_ALIGN
 
-    # Ensure first chunk is numpy array on CPU
-    corrected_chunks = [np.asarray(chunks[0])]
-    estimated_cumulative_phases = [0.0]
+        if sdr_rate is None or pilot_freq is None:
+            logger.error("Missing SDR rate or pilot freq for WPD alignment. Skipping alignment.")
+            processed_chunks_list = chunks_cpu # Keep original if skipping
+        else:
+            chunk_len = len(chunks_cpu[0]) if num_chunks > 0 else 0
+            overlap_samples = int(chunk_len * overlap_factor)
+            logger.info(f"WPD Alignment: Wavelet='{wpd_wavelet}', Level={wpd_level}, Overlap={overlap_samples}")
 
-    # Define GPU variables list for cleanup (only relevant if cupy_available)
-    gpu_vars_to_clean = ['prev_segment_gpu', 'curr_segment_gpu', 'xcorr_mag_gpu',
-                         'xcorr_slice_gpu', 'best_lag_idx_in_search_gpu',
-                         'aligned_curr_gpu', 'aligned_prev_gpu',
-                         'complex_prod_gpu', 'phasors_gpu', 'avg_phasor_gpu',
-                         'delta_phi_gpu']
-
-    for i in tqdm(range(1, len(chunks)), desc="Phase Correlation"):
-        # Get previous corrected chunk (CPU) and current original chunk (CPU)
-        prev_chunk_cpu = np.asarray(corrected_chunks[i-1]) # Previous is already corrected
-        curr_chunk_cpu = np.asarray(chunks[i]) # Current is original input
-
-        # Check overlap validity (CPU)
-        if overlap_samples_recon <= 1 or len(prev_chunk_cpu) < overlap_samples_recon or len(curr_chunk_cpu) < overlap_samples_recon:
-            status = f"samples={overlap_samples_recon}" if overlap_samples_recon <= 1 else f"len prev={len(prev_chunk_cpu)},curr={len(curr_chunk_cpu)}"
-            logger.warning(f"Insufficient overlap ({status}) for chunk {i}. Skipping correction step.")
-            estimated_cumulative_phases.append(estimated_cumulative_phases[-1])
-            corrected_chunks.append(curr_chunk_cpu) # Append the uncorrected chunk
-            continue
-
-        # Extract overlapping segments (CPU)
-        prev_segment_cpu = prev_chunk_cpu[-overlap_samples_recon:]
-        curr_segment_cpu = curr_chunk_cpu[:overlap_samples_recon]
-
-        # Initialize defaults
-        delta_phi = 0.0
-        best_lag = 0
-
-        # --- GPU/CPU Processing Block ---
-        # Initialize device variables (set to None if using CPU)
-        prev_segment_dev, curr_segment_dev = None, None
-        aligned_curr_dev, aligned_prev_dev = None, None
-        # ... other device vars ...
-
-        try:
-            # Transfer data to device (GPU or CPU)
-            prev_segment_dev = xp.asarray(prev_segment_cpu)
-            curr_segment_dev = xp.asarray(curr_segment_cpu)
-
-            # Compute cross-correlation of magnitudes on device
-            max_lag = min(max_lag_abs, int(overlap_samples_recon * max_lag_fraction))
-            xcorr_mag_dev = xp.correlate(xp.abs(curr_segment_dev), xp.abs(prev_segment_dev), mode='full')
-
-            # Lag calculation (indices on CPU, argmax on device)
-            n_curr = len(curr_segment_dev); n_prev = len(prev_segment_dev)
-            lags = np.arange(-(n_curr - 1), n_prev) # Always CPU
-            search_indices = np.where(np.abs(lags) <= max_lag)[0]
-
-            if len(search_indices) > 0:
-                valid_search_indices = search_indices[(search_indices >= 0) & (search_indices < len(xcorr_mag_dev))]
-                if len(valid_search_indices) > 0:
-                    xcorr_slice_dev = xcorr_mag_dev[valid_search_indices]
-                    best_lag_idx_in_search_dev = xp.argmax(xp.abs(xcorr_slice_dev))
-                    best_lag_idx_in_search = int(best_lag_idx_in_search_dev.get()) if cupy_available else int(best_lag_idx_in_search_dev)
-                    best_overall_idx = valid_search_indices[best_lag_idx_in_search]
-                    best_lag = lags[best_overall_idx] # CPU lag
-
-            # Align segments on device
-            if best_lag > 0:
-                aligned_curr_dev = curr_segment_dev[best_lag:]
-                aligned_prev_dev = prev_segment_dev[:len(aligned_curr_dev)]
-            elif best_lag < 0:
-                aligned_prev_dev = prev_segment_dev[abs(best_lag):]
-                aligned_curr_dev = curr_segment_dev[:len(aligned_prev_dev)]
+            if overlap_samples < 32:
+                logger.warning(f"Overlap ({overlap_samples}) too small. Skipping alignment.")
+                processed_chunks_list = chunks_cpu
             else:
-                aligned_curr_dev = curr_segment_dev
-                aligned_prev_dev = prev_segment_dev
+                pilot_subband_path, _ = _determine_wpd_pilot_path(sdr_rate, pilot_freq, overlap_samples, wpd_wavelet, wpd_level)
 
-            # Estimate phase using Phasor Averaging on device
-            if len(aligned_curr_dev) > 0 and len(aligned_prev_dev) > 0:
-                min_len = min(len(aligned_curr_dev), len(aligned_prev_dev))
-                complex_prod_dev = aligned_curr_dev[:min_len] * xp.conj(aligned_prev_dev[:min_len])
-                magnitudes_dev = xp.abs(complex_prod_dev) + 1e-20
-                phasors_dev = complex_prod_dev / magnitudes_dev
-                avg_phasor_dev = xp.mean(phasors_dev)
-                if xp.abs(avg_phasor_dev) > 1e-12:
-                    delta_phi_dev = xp.angle(avg_phasor_dev)
-                    delta_phi = float(delta_phi_dev.get()) if cupy_available else float(delta_phi_dev) # CPU float
+                if pilot_subband_path is None:
+                    logger.error("Failed to find pilot subband. Skipping alignment.")
+                    processed_chunks_list = chunks_cpu
+                else:
+                    # --- Alignment Loop ---
+                    phase_deltas_log = []
+                    for i in tqdm(range(1, num_chunks), desc="WPD Phase Align"):
+                        prev_chunk_cpu = processed_chunks_list[-1] # Prev corrected (CPU)
+                        curr_chunk_original_cpu = chunks_cpu[i]    # Current original (CPU)
 
-        except Exception as corr_e:
-             logger.error(f"ERROR during correlation computation for chunk {i}: {corr_e}. Using delta_phi=0.", exc_info=True)
-             delta_phi = 0.0
-             best_lag = 0
-        finally:
-             # --- Clear GPU memory (only if CuPy was used) ---
-             if cupy_available:
-                 # Define list of GPU vars created in the try block
-                 gpu_vars_loop = ['prev_segment_dev', 'curr_segment_dev', 'xcorr_mag_dev',
-                                  'xcorr_slice_dev', 'best_lag_idx_in_search_dev',
-                                  'aligned_curr_dev', 'aligned_prev_dev',
-                                  'complex_prod_dev', 'magnitudes_dev', 'phasors_dev',
-                                  'avg_phasor_dev', 'delta_phi_dev']
-                 for var_name in gpu_vars_loop:
-                      if var_name in locals() and isinstance(locals()[var_name], cp.ndarray):
-                          try:
-                              del locals()[var_name]
-                          except NameError: pass # Variable might not exist if error occurred early
-                 try:
-                      mempool = cp.get_default_memory_pool()
-                      mempool.free_all_blocks()
-                 except Exception as mem_e:
-                      logger.warning(f"Error freeing CuPy memory pool: {mem_e}")
-        # --- End GPU/CPU Processing Block ---
+                        delta_phi = 0.0
+                        # Ensure lengths are sufficient
+                        if len(prev_chunk_cpu) < overlap_samples or len(curr_chunk_original_cpu) < overlap_samples:
+                             logger.warning(f"Chunk {i}: Insufficient overlap length. delta_phi=0.")
+                        else:
+                             # Extract overlaps (CPU for pywt)
+                             prev_overlap_cpu = prev_chunk_cpu[-overlap_samples:]
+                             curr_overlap_cpu = curr_chunk_original_cpu[:overlap_samples]
+                             try:
+                                 # Perform WPD (CPU)
+                                 wp_prev = pywt.WaveletPacket(data=prev_overlap_cpu, wavelet=wpd_wavelet, mode='symmetric', maxlevel=wpd_level)
+                                 wp_curr = pywt.WaveletPacket(data=curr_overlap_cpu, wavelet=wpd_wavelet, mode='symmetric', maxlevel=wpd_level)
+                                 prev_coeffs = wp_prev[pilot_subband_path].data
+                                 curr_coeffs = wp_curr[pilot_subband_path].data
 
-        # Diagnostic Log
-        logger.info(f"  Chunk {i}: Est. Lag = {best_lag}, Delta Phi (Phasor Avg, deg) = {np.rad2deg(delta_phi):.4f}")
+                                 if len(prev_coeffs) > 0 and len(curr_coeffs) > 0:
+                                     # Phase calc (CPU)
+                                     prev_phase_unwrapped = np.unwrap(np.angle(prev_coeffs.astype(np.complex128)))
+                                     curr_phase_unwrapped = np.unwrap(np.angle(curr_coeffs.astype(np.complex128)))
+                                     delta_phi = np.mean(curr_phase_unwrapped - prev_phase_unwrapped)
+                                 else: logger.warning(f"Chunk {i}: Empty pilot coeffs. delta_phi=0.")
+                             except Exception as e: logger.error(f"Chunk {i} WPD/Phase Error: {e}. delta_phi=0.", exc_info=False)
 
-        # Update cumulative phase (CPU)
-        prev_cumulative = estimated_cumulative_phases[-1]
-        current_cumulative_phase = prev_cumulative + delta_phi # Apply correction based on measurement
-        estimated_cumulative_phases.append(current_cumulative_phase)
+                        phase_deltas_log.append(np.rad2deg(delta_phi))
+                        logger.info(f"  Chunk {i}: Delta Phi = {np.rad2deg(delta_phi):.4f} deg")
 
-        # Apply phase correction (CPU) using original CPU chunk data
-        corrected_chunk_cpu = curr_chunk_cpu * np.exp(-1j * current_cumulative_phase)
-        corrected_chunks.append(corrected_chunk_cpu) # Store corrected CPU array
-
-    logger.info("--- Improved Phase Correlation Complete ---")
-    # Ensure all returned chunks are numpy arrays (they should be)
-    return corrected_chunks, estimated_cumulative_phases
-
-
-# --- WPD function updated with logging ---
-def correct_phase_wpd(chunks, wavelet='db4', level=4):
-    """
-    Performs intra-chunk phase detrending using Wavelet Packet Decomposition (CPU).
-    """
-    logger.info(f"Applying Wavelet-Based Phase Correction (Wavelet: {wavelet}, Level: {level})")
-    wpd_corrected_chunks = []
-    try:
-        wavelet_obj = pywt.Wavelet(wavelet)
-    except ValueError as e: logger.error(f"Invalid wavelet: {e}"); return chunks
-    except Exception as e: logger.error(f"Wavelet init error: {e}"); return chunks
-
-    for i, chunk in tqdm(enumerate(chunks), total=len(chunks), desc="WPD Processing"):
-        chunk_np = np.asarray(chunk)
-        if len(chunk_np) <= 2: wpd_corrected_chunks.append(chunk_np); continue
-        try:
-            max_level = pywt.dwt_max_level(len(chunk_np), wavelet_obj); actual_level = min(level, max_level)
-            if level > max_level: logger.warning(f"WPD Lvl {level}>{max_level} Chk {i}. Using {actual_level}.")
-            if actual_level <= 0: logger.warning(f"WPD Lvl {actual_level} invalid Chk {i}."); wpd_corrected_chunks.append(chunk_np); continue
-
-            wp_real = pywt.WaveletPacket(data=np.real(chunk_np), wavelet=wavelet, mode='symmetric', maxlevel=actual_level)
-            wp_imag = pywt.WaveletPacket(data=np.imag(chunk_np), wavelet=wavelet, mode='symmetric', maxlevel=actual_level)
-            nodes_real = wp_real.get_level(actual_level, 'natural')
-
-            for node_real in nodes_real:
-                try:
-                    node_path = node_real.path
-                    if not isinstance(node_path, str) or node_path not in wp_imag: continue
-                    node_imag = wp_imag[node_path]
-                    real_data = np.array(node_real.data); imag_data = np.array(node_imag.data)
-                    coeffs = real_data + 1j * imag_data
-                    if len(coeffs) > 1:
-                        inst_phase = np.unwrap(np.angle(coeffs + 1e-30)); x = np.arange(len(inst_phase)); A = np.vstack([x, np.ones_like(x)]).T
+                        # Update & Apply Cumulative Phase Correction
+                        cumulative_phase = estimated_cumulative_phases[i-1] + delta_phi
+                        estimated_cumulative_phases[i] = cumulative_phase
                         try:
-                            slope, intercept = np.linalg.lstsq(A, inst_phase, rcond=None)[0]
-                            linear_phase = intercept + slope * x; coeffs_corrected = coeffs * np.exp(-1j * linear_phase)
-                            node_real.data = coeffs_corrected.real; node_imag.data = coeffs_corrected.imag
-                        except np.linalg.LinAlgError: logger.debug(f"LinAlgError node {node_path} Chk {i}")
-                except Exception as node_e: logger.debug(f"Node error {node_path} Chk {i}: {node_e}")
+                            # Apply correction using chosen backend
+                            curr_chunk_dev = xp.asarray(curr_chunk_original_cpu) # Move original to device
+                            correction_factor = xp.exp(-1j * cumulative_phase)
+                            corrected_chunk_dev = curr_chunk_dev * correction_factor
 
-            corrected_real = wp_real.reconstruct(update=False); corrected_imag = wp_imag.reconstruct(update=False)
-            corrected_chunk = (corrected_real + 1j * corrected_imag).astype(np.complex128)
-            if len(corrected_chunk) != len(chunk_np): # Length correction
-                 logger.debug(f"WPD Len Corr Chk {i}: {len(corrected_chunk)} vs {len(chunk_np)}")
-                 corrected_chunk = corrected_chunk[:len(chunk_np)]
-                 if len(corrected_chunk) < len(chunk_np): corrected_chunk = np.pad(corrected_chunk, (0, len(chunk_np) - len(corrected_chunk)), 'constant')
-            chunk_rms = np.sqrt(np.mean(np.abs(chunk_np)**2)); corrected_rms = np.sqrt(np.mean(np.abs(corrected_chunk)**2))
-            if chunk_rms > 1e-12 and corrected_rms > 1e-12: corrected_chunk *= (chunk_rms / corrected_rms)
-            wpd_corrected_chunks.append(corrected_chunk)
-        except Exception as e: logger.error(f"WPD Error Chk {i}: {e}", exc_info=False); wpd_corrected_chunks.append(chunk_np)
-    logger.info("WPD Phase Correction Complete")
-    return wpd_corrected_chunks
+                            # Store result as CPU array
+                            processed_chunks_list.append(cp.asnumpy(corrected_chunk_dev) if use_gpu else corrected_chunk_dev)
+
+                            # Clean up GPU mem for this iter
+                            if use_gpu: del curr_chunk_dev, correction_factor, corrected_chunk_dev; cp.get_default_memory_pool().free_all_blocks()
+                        except Exception as e:
+                            logger.error(f"Chunk {i} Correction Error: {e}. Appending original.", exc_info=False)
+                            processed_chunks_list.append(curr_chunk_original_cpu) # Append original on error
+                            estimated_cumulative_phases[i] = estimated_cumulative_phases[i-1] # Revert phase estimate
+
+                    logger.info(f"Phase deltas applied (deg): {phase_deltas_log}")
+                    logger.info("--- Wavelet Phase Alignment Complete ---")
+    else:
+        logger.info("Skipping Wavelet Phase Alignment (disabled in config).")
+        processed_chunks_list = chunks_cpu # Keep original CPU arrays
+
+
+    # --- Pilot Tone Removal Step ---
+    if config.APPLY_PILOT_REMOVAL:
+        logger.info("--- Applying Pilot Tone Removal ---")
+        sdr_rate = global_attrs.get('sdr_sample_rate_hz')
+        pilot_freq = global_attrs.get('pilot_offset_hz')
+        notch_q = config.PILOT_NOTCH_Q
+
+        if sdr_rate is None or pilot_freq is None:
+            logger.error("Missing rate/freq for pilot removal. Skipping.")
+        else:
+            try:
+                # Design notch filter coefficients (once on CPU)
+                b_notch, a_notch = iirnotch(pilot_freq, Q=notch_q, fs=sdr_rate)
+                b_notch = b_notch.astype(np.float64)
+                a_notch = a_notch.astype(np.float64)
+                logger.info(f"Notch filter designed for {pilot_freq/1e6:.3f} MHz (Q={notch_q})")
+
+                # Apply filtering using appropriate backend
+                chunks_to_filter = [ensure_array(chunk, use_gpu=use_gpu) for chunk in processed_chunks_list]
+                
+                filtered_chunks_device = []
+                if use_gpu and cusignal_available:
+                    logger.info("Attempting pilot removal with cuSignal filtfilt...")
+                    b_gpu = cp.asarray(b_notch)
+                    a_gpu = cp.asarray(a_notch)
+                    all_successful = True
+                    for i, chunk_dev in tqdm(enumerate(chunks_to_filter), total=num_chunks, desc="GPU Notch Filtering"):
+                        if len(chunk_dev) > max(len(a_gpu), len(b_gpu)) * 3:
+                             try:
+                                 filtered_chunk_dev = cusignal.filtfilt(b_gpu, a_gpu, chunk_dev)
+                                 filtered_chunks_device.append(filtered_chunk_dev)
+                             except Exception as e:
+                                 logger.error(f"GPU filtfilt error chunk {i}: {e}. Will fallback to CPU for ALL chunks.", exc_info=False)
+                                 all_successful = False
+                                 break # Exit loop on first error, fallback strategy below
+                        else:
+                            logger.warning(f"Chunk {i} too short for filtfilt. Keeping unfiltered.")
+                            filtered_chunks_device.append(chunk_dev) # Keep original if too short
+
+                    if not all_successful:
+                        logger.warning("Fallback to CPU filtfilt due to GPU errors.")
+                        use_gpu = False # Force CPU path below
+                    else:
+                        processed_chunks_list = filtered_chunks_device # Keep results on GPU for now if successful
+
+                # If not using GPU or fallback needed
+                if not use_gpu or not cusignal_available:
+                    logger.info("Applying pilot removal with SciPy filtfilt on CPU...")
+                    filtered_chunks_cpu = []
+                    for i, chunk_dev in tqdm(enumerate(chunks_to_filter), total=num_chunks, desc="CPU Notch Filtering"):
+                        # Ensure chunk is on CPU
+                        chunk_cpu = cp.asnumpy(chunk_dev) if cupy_available and isinstance(chunk_dev, cp.ndarray) else chunk_dev
+                        if len(chunk_cpu) > max(len(a_notch), len(b_notch)) * 3:
+                            try:
+                                filtered_chunk_cpu = filtfilt(b_notch, a_notch, chunk_cpu)
+                                filtered_chunks_cpu.append(filtered_chunk_cpu.astype(np.complex128))
+                            except Exception as e:
+                                logger.error(f"CPU filtfilt error chunk {i}: {e}. Appending original.", exc_info=False)
+                                filtered_chunks_cpu.append(chunk_cpu) # Append original chunk on error
+                        else:
+                            logger.warning(f"Chunk {i} too short for filtfilt. Appending original.")
+                            filtered_chunks_cpu.append(chunk_cpu)
+                    processed_chunks_list = filtered_chunks_cpu # Update list with CPU results
+
+                logger.info("--- Pilot Tone Removal Complete ---")
+
+            except ValueError as ve:
+                logger.error(f"Error designing notch filter (invalid freq/Q?): {ve}. Skipping removal.", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error during pilot removal setup: {e}. Skipping removal.", exc_info=True)
+    else:
+        logger.info("Skipping Pilot Tone Removal (disabled in config).")
+
+    # --- Final Conversion and Return ---
+    # Ensure all results are returned as NumPy arrays on CPU
+    final_cpu_chunks = []
+    for chunk in processed_chunks_list:
+        if cupy_available and isinstance(chunk, cp.ndarray):
+            final_cpu_chunks.append(cp.asnumpy(chunk))
+        else:
+            final_cpu_chunks.append(np.asarray(chunk)) # Ensure it's numpy
+
+    if len(final_cpu_chunks) != num_chunks:
+        logger.error("Length mismatch in final processed chunks list! Returning original.")
+        return [np.asarray(c) for c in chunks_in], [0.0] * len(chunks_in)
+
+    # Final GPU memory cleanup
+    if cupy_available:
+        cp.get_default_memory_pool().free_all_blocks()
+
+    logger.info("===== Phase Correction Module Finished =====")
+    return final_cpu_chunks, estimated_cumulative_phases
