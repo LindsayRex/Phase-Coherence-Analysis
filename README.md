@@ -1,22 +1,4 @@
-
-**How to Use: **
-
-To Generate Simulated data signal to analysis: 
-    
-    Python "PC_Simulated_data_generator.py"
-
-To reconstruct the 400MHz signal with the reconstruction module using wavelets: 
-
-    Python -m "Reconstruction Module.main"
-
-  This will read the  .h5  file data and output the graphs and analysis accordingly.  
-
-**Requirements: **
-
-    CUDA / NVIDIA GPU will help a lot otherwise calculations will fall back to back to CPU.
-
-
-**Background: ** 
+**Background:**
 Research suggests wavelets could be adapted for reconstructing wideband signals from narrowband chunks, addressing phase coherence 
 through decomposition and alignment, but no direct examples exist for SDRs. The evidence leans toward the  idea being innovative, 
 as most related work focuses on speech or other domains, not SDRs with limited bandwidth. This presents an opportunity for novel research,
@@ -36,7 +18,7 @@ frequency granularity. After capturing narrowband chunks (e.g., 56 MHz segments 
 Phase offsets due to SDR oscillator drift or timing jitter are estimated by comparing overlapping regions or using a reference signal. 
 The inverse WPD then reconstructs the wideband signal, adjusting coefficients to ensure phase coherence.
 
-Reference Mathematics:
+**Reference Mathematics:**
 Wavelet Packet Decomposition: For a signal ( x(t) ), the WPD at level ( j ) and node ( n ) is:
 W_{j,n}(t) = \sum_k c_{j,n}(k) \psi_{j,k}(t)
 where \psi_{j,k}(t) = 2^{j/2} \psi(2^j t - k) is the wavelet function, c_{j,n}(k) are coefficients, and ( n ) indexes the frequency subband.
@@ -85,3 +67,23 @@ x(t) = \sum_j \sum_k c_{j,k}' \psi_{j,k}(t)
 with phase-locked coefficients c_{j,k}'.
 
 Source: Derived from “Critically-Sampled Wavelet Reconstruction” (MathWorks) and general wavelet theory, with phase-locking as a novel extension.
+
+
+**How to Use:**
+
+To Generate Simulated data signal to analysis: 
+    
+    Python "PC_Simulated_data_generator.py"
+
+To reconstruct the 400MHz signal with the reconstruction module using wavelets: 
+
+    Python -m "Reconstruction Module.main"
+
+  This will read the  .h5  file data and output the graphs and analysis accordingly.  
+
+**Requirements: **
+
+    CUDA / NVIDIA GPU will help a lot otherwise calculations will fall back to back to CPU.
+
+
+
