@@ -73,11 +73,11 @@ Source: Derived from “Critically-Sampled Wavelet Reconstruction” (MathWorks)
 
 To Generate Simulated data signal to analysis: 
     
-    Python "PC_Simulated_data_generator.py"
+    /Phase-Coherence-Analysis/ ./PC_Simulated_data_generator.py
 
 To reconstruct the 400MHz signal with the reconstruction module using wavelets: 
 
-    Python -m "Reconstruction Module.main"
+    /Phase-Coherence-Analysis/Python -m "Reconstruction Module.main"
 
   This will read the  .h5  file data and output the graphs and analysis accordingly.  
 
